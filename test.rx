@@ -1,0 +1,31 @@
+
+(struct foo
+  (feh i32))
+
+(function a ((blah foo)) i32
+   [blah'feh])
+
+rx::eof
+
+(struct foo
+  (blix i32)
+  (gerp [i32 30]))
+
+(template ((T K V) (move* T) (map* K V))
+  (enum maybe
+    (just T)
+    (nothing)))
+
+
+(function hi ((blah i32)) i32
+
+  (let ((var 1))
+    var)
+
+  (match (just 4)
+    (nothing 49)
+    ((just y) y))
+
+
+  (hi (+ blah 1) 1 3)
+  (return (+ (- 1 2 3) blah)))
