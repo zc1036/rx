@@ -65,6 +65,14 @@
   ((bits :type integer :accessor int-t/bits :initarg :bits)
    (signed :type boolean :accessor int-t/signed :initarg :signed)))
 
+(defun ty-equal (a b)
+  (assert (and a b))
+  (match (list a b)
+    ((list (ty.int-t (bits bits-1) (signed signed-1))
+           (ty.int-t (bits bits-2) (signed signed-2)))
+     (and (= bits-1 bits-2)
+          (eq signed-1 signed-2)))))
+
 ;; TYPEDESC class
 
 (defclass typedesc ()
@@ -85,8 +93,19 @@
 (defclass typedesc.pointer-desc (typedesc)
   ((base-type :type typedesc :accessor pointer-desc/base-type :initarg :base-type)))
 
-(defgeneric format-type (desc &optional child))
+(defun type/is-integral (obj)
+  (assert obj)
+  (match obj
+    ((ty.int-t)
+     obj)
+    ((typedesc.ref-desc :ref r)
+     (type/is-integral r))
+    ((ast.expression :type typ)
+     (type/is-integral typ))))
 
+;; FORMAT-TYPE
+
+(defgeneric format-type (desc &optional child))
 
 ;; (defmethod format-type ((desc typedesc.name-desc) &optional child)
   ;; (format nil "~a~a~a" desc (if child " " "") (or child "")))
@@ -104,7 +123,7 @@
 
 (defmethod format-type ((type typedesc.ref-desc) &optional child)
   (format nil "~a~a~a"
-          (ty/name type)
+          (ty/name (ref-desc/ref type))
           (if child " " "")
           (if child child "")))
 
@@ -112,7 +131,7 @@
   (with-slots (base-type dimms) type
     (format nil "~a~{[~a]~}"
             (format-type base-type child)
-            (mapcar #'format-type dimms))))
+            dimms)))
 
 ;;; AST
 
@@ -173,33 +192,28 @@
 (defstruct function-arg
   name type)
 
-(defclass ast.expression.var (ast.expression)
-  ((name :type symbol :accessor var/name :initarg :name)))
-
-(defun binop-lassoc (name rest)
-  (if (= (length rest) 2)
-      (make-instance 'ast.expression.binop
-                     :op name
-                     :lhs (car rest)
-                     :rhs (cadr rest))
-      (binop-lassoc name
-                    (cons (make-instance 'ast.expression.binop
-                                         :op name
-                                         :lhs (car rest)
-                                         :rhs (cadr rest))
-                          (cddr rest)))))
-
 (defgeneric format-ast (node &optional toplevel))
+
+(defmethod format-ast :before (node &optional toplevel)
+  (assert (or (not (typep node 'ast.expression))
+              (expression/type node))))
 
 (defmethod format-ast ((node ast.statement.return) &optional toplevel)
   (assert (not toplevel))
 
   (format nil "return (~a)" (format-ast (return/body node))))
 
-(defmethod format-ast ((node ast.expression.var) &optional toplevel)
+(defmethod format-ast ((node ast.expression.identifier) &optional toplevel)
   (assert (not toplevel))
 
-  (symbol-name (var/name node)))
+  (symbol-name (identifier/symbol node)))
+
+(defmethod format-ast ((node ast.expression.number) &optional toplevel)
+  (assert (not toplevel))
+
+  (format nil "((~a)~a)"
+          (ty/name (ref-desc/ref (expression/type node)))
+          (number/value node)))
 
 (defmethod format-ast ((node ast.statement.function) &optional toplevel)
   (assert toplevel)
@@ -217,37 +231,42 @@
         (format str "  ~a;~%" (format-ast n)))
       (format str "}~%"))))
 
+(defmethod format-ast ((node ast.expression.prop-access) &optional toplevel)
+  (assert (not toplevel))
+
+  (with-slots (base member) node
+    (format nil "(~a.~a)" (format-ast base) member)))
+
 (defmethod format-ast ((node ast.statement.struct) &optional toplevel)
   (assert toplevel)
 
   (with-slots (name field-names field-types) node
     (with-output-to-string (str)
-      (format str "struct ~a {~%~{~a;~%~} };~%"
+      (format str "typedef struct ~a {~%~{~a;~%~}} ~a;~%"
               name
               (loop for field-name in field-names for field-type in field-types
-                    collect (format-type field-type field-name))))))
+                    collect (format-type field-type field-name))
+              name))))
 
 (defmethod format-ast ((node ast.expression.binop) &optional toplevel)
   (assert (not toplevel))
 
   (with-slots (op lhs rhs) node
-    (format nil "(~a) ~a (~a)" (format-ast lhs) op (format-ast rhs))))
-
-(defmethod format-ast ((node integer) &optional toplevel)
-  (assert (not toplevel))
-
-  (format nil "~a" node))
+    (format nil "(~a ~a ~a)" (format-ast lhs) op (format-ast rhs))))
 
 (defmethod format-ast ((node ast.expression.funcall) &optional toplevel)
   (declare (ignore toplevel))
   (with-slots (target args) node
-    (format nil "(~a)(~{(~a)~^, ~})" (format-ast target) (mapcar #'format-ast args))))
+    (format nil "(~a(~{~a~^, ~}))" (format-ast target) (mapcar #'format-ast args))))
 
-;(defmacro rx-kw:+ (&rest args)
-;  `(binop-lassoc "+" (list ,@args)))
-;
-;(defmacro rx-kw:- (&rest args)
-;  `(binop-lassoc "-" (list ,@args)))
+(defun binop-lassoc (name rest)
+  )
+
+(defmacro rx-kw:+ (&rest args)
+ `(binop-lassoc "+" (list ,@args)))
+
+(defmacro rx-kw:- (&rest args)
+ `(binop-lassoc "-" (list ,@args)))
 
 ;(defun pretty-print-clos-object (object)
 ;  (let* ((class (class-of object))
@@ -384,6 +403,24 @@
                         (make-instance 'ty.int-t :name "int32_t" :bits 32 :signed t)))
     compiler))
 
+(defun compiler.parse-nary-op-to-binary-lassoc (compiler name ast1 ast2 rest)
+  (let ((expr (make-instance 'ast.expression.binop
+                             :op name
+                             :lhs ast1
+                             :rhs ast2)))
+    (if rest
+        (compiler.parse-nary-op-to-binary-lassoc
+         compiler
+         name
+         (make-instance 'ast.expression.binop
+                        :op name
+                        :lhs ast1
+                        :rhs ast2)
+         (compiler.parse compiler (car rest))
+         (cdr rest))
+
+        expr)))
+
 (defun compiler.parse (compiler form)
   (with-slots (lexenv) compiler
     (ematch form
@@ -401,17 +438,22 @@
        (make-instance 'ast.expression.number :value form))
       ((type symbol)
        (make-instance 'ast.expression.identifier :symbol form))
-      ((list 'quote x)
-       )
       ((type string)
-       (make-instance 'ast.expression.string :value form)))))
+       (make-instance 'ast.expression.string :value form))
+      ((list* (and op-name (or rx-kw:+)) arg1 arg2 rest)
+       (compiler.parse-nary-op-to-binary-lassoc
+        compiler
+        (symbol-name op-name)
+        (compiler.parse compiler arg1)
+        (compiler.parse compiler arg2)
+        rest)))))
 
 (defun compiler.parse-prop (compiler base member)
   (ematch member
-    ((list 'quote _)
+    ((list 'quote mbr-sym)
      (make-instance 'ast.expression.prop-access
                     :base (compiler.parse compiler base)
-                    :member member))
+                    :member mbr-sym))
     ((integer)
      (make-instance 'ast.expression.array-sub
                     :base (compiler.parse compiler base)
@@ -421,7 +463,11 @@
   "form -> AST"
   (ematch typ
     ((type symbol)
-     (make-instance 'ast.expression.identifier :symbol typ))))
+     (make-instance 'ast.expression.identifier :symbol typ))
+    ((list 'rx-kw:prop arr-type (and (type integer) bound))
+     (make-instance 'ast.expression.array-sub
+                    :base (compiler.parse-type compiler arr-type)
+                    :sub bound))))
 
 (defun compiler.parse-struct (compiler name members)
   (typecheck name 'symbol)
@@ -440,7 +486,10 @@
                      :kind "struct"
                      :name name
                      :field-names field-names
-                     :field-types (mapcar (bind #'compiler.parse-type compiler)
+                     :field-types (mapcar (lambda (x)
+                                            (compiler.ast-to-typedesc
+                                             compiler
+                                             (compiler.parse-type compiler x)))
                                           field-types)))))
 
 (defun compiler.parse-function (compiler name args ret-type body)
@@ -456,15 +505,18 @@
 
                                      (make-function-arg
                                       :name arg-name
-                                      :type (compiler.parse-type compiler arg-type))))))
-          (parsed-ret-type (compiler.parse-type compiler ret-type))
+                                      :type (compiler.ast-to-typedesc compiler (compiler.parse-type compiler arg-type)))))))
+          (ret-type (compiler.ast-to-typedesc compiler (compiler.parse-type compiler ret-type)))
           (parsed-body (mapcar (lambda (stmt) (compiler.parse compiler stmt)) body)))
       (make-instance 'ast.statement.function
                      :kind "function"
                      :name name
                      :args arg-structs
-                     :ret-type parsed-ret-type
+                     :ret-type ret-type
                      :body parsed-body))))
+
+;; ((ast.expression.number)
+;;  (make-instance 'typedesc.ref-desc :name "int32_t" :ref (lexical-env.lookup-or-error lexenv "int32_t")))
 
 (defun compiler.ast-to-typedesc (compiler ast)
   "AST -> typedesc"
@@ -475,8 +527,10 @@
         (ematch (lexical-env.lookup-or-error lexenv name)
           ((and typ (ty :name name))
            (make-instance 'typedesc.ref-desc :name name :ref typ))))
-       ((ast.expression.number)
-        (make-instance 'typedesc.ref-desc :name "int32_t" :ref (lexical-env.lookup-or-error lexenv "int32_t")))
+       ((ast.expression.array-sub :base (and (ast) base-type) :sub (and (type integer) bound))
+        (make-instance 'typedesc.array-desc
+                       :base-type (compiler.ast-to-typedesc compiler base-type)
+                       :dimms (list bound)))
        ((ast.expression.funcall :target 'rx-kw:-> :args args)
         (ematch args
           ((list ret-type)
@@ -503,13 +557,10 @@
                     (ematch arg
                       ((function-arg :name name :type typ)
                        (typecheck name 'symbol)
-
-                       (let ((arg-type (compiler.ast-to-typedesc compiler typ)))
-                         (lexical-env.push (compiler-lexenv compiler) name arg-type)
-                         arg-type)))))
-            (ret-type-checked (compiler.ast-to-typedesc compiler ret-type)))
+                       (lexical-env.push (compiler-lexenv compiler) name typ)
+                       typ)))))
         (setf (function/type ast) (make-instance 'typedesc.func-desc
-                                                 :ret-type ret-type-checked
+                                                 :ret-type ret-type
                                                  :arg-types arg-types))
         (lexical-env.push (compiler-lexenv compiler) name (function/type ast))
         (loop for stmt in body do
@@ -517,17 +568,12 @@
 
 (defun compiler.check-types-struct (compiler ast)
   (with-slots (name field-names field-types) ast
-    (let ((actual-field-types (loop for field-name in field-names
-                                    for field-type-desc in field-types
-                                    collect (ematch (list field-name field-type-desc)
-                                              ((list (type symbol) _)
-                                               (compiler.ast-to-typedesc compiler field-type-desc))))))
-      (lexical-env.push (compiler-lexenv compiler)
-                        name
-                        (make-instance 'ty.struct-t
-                                       :name name
-                                       :field-names field-names
-                                       :field-types actual-field-types)))))
+    (lexical-env.push (compiler-lexenv compiler)
+                      name
+                      (make-instance 'ty.struct-t
+                                     :name name
+                                     :field-names field-names
+                                     :field-types field-types))))
 
 (defun compiler.check-types-struct-member-access (compiler ast base member-sym)
   (setf (expression/type ast)
@@ -547,7 +593,7 @@
 
   (let ((base-type (expression/type base)))
     (ematch (list base-type member)
-      ((list (typedesc.ref-desc :ref (ty.struct-t)) (list 'quote member-name))
+      ((list (typedesc.ref-desc :ref (ty.struct-t)) member-name)
        (typecheck member-name 'symbol)
        (compiler.check-types-struct-member-access compiler ast base member-name))
       ((list (typedesc.array-desc) _)
@@ -563,6 +609,31 @@
 (defun compiler.check-types-identifier (compiler ast)
   (setf (expression/type ast) (compiler.lookup-symbol-type compiler (identifier/symbol ast))))
 
+(defun compiler.check-types-number (compiler ast)
+  (setf (expression/type ast)
+        (make-instance 'typedesc.ref-desc
+                       :name "int32_t"
+                       :ref (lexical-env.lookup-or-error
+                             (compiler-lexenv compiler)
+                             'rx-kw:i32))))
+
+(defun compiler.check-types-binop (compiler ast)
+  (with-slots (op lhs rhs) ast
+    (compiler.check-types compiler lhs)
+    (compiler.check-types compiler rhs)
+
+    (let ((lhs-int (type/is-integral lhs))
+          (rhs-int (type/is-integral rhs)))
+      (unless (and lhs-int
+                   rhs-int
+                   (ty-equal lhs-int rhs-int))
+        (error "Type mismatch in operator ~a: Expression ~a and ~a are not integral or are different"
+               ast
+               lhs
+               rhs))
+      (setf (expression/type ast)
+            (expression/type lhs)))))
+
 (defun compiler.check-types (compiler ast)
   (ematch ast
     ((ast.statement.function)
@@ -571,8 +642,12 @@
      (compiler.check-types-struct compiler ast))
     ((ast.expression.prop-access :base base :member member)
      (compiler.check-types-prop compiler ast base member))
-    ((ast.expression.identifier :symbol sym)
-     (compiler.check-types-identifier compiler ast))))
+    ((ast.expression.identifier)
+     (compiler.check-types-identifier compiler ast))
+    ((ast.expression.number)
+     (compiler.check-types-number compiler ast))
+    ((ast.expression.binop)
+     (compiler.check-types-binop compiler ast))))
 
 (defun read-property-access (stream char)
   `(rx-kw:prop ,@(read-delimited-list #\] stream)))
@@ -593,7 +668,8 @@
               do
                  (let ((ast (compiler.parse compiler x)))
                    (compiler.check-types compiler ast)
-                   (format t "~a~%" (big-print-clos-object ast))))
+                   (format t "~a~%" (big-print-clos-object ast))
+                   (format t "~a~%" (format-ast ast t))))
                                         ;    (loop for x across *output* do
                                         ;      (format t "~a~%" (pretty-print-clos-object x))
                                         ;      (format t "~a~%" (format-ast x t)))

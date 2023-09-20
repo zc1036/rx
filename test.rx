@@ -1,15 +1,17 @@
 
 (struct foo
-  (feh i32))
+  (feh i32)
+  (fehp i32))
 
 (function a ((blah foo)) i32
-   [blah'feh])
+  (+ [blah'fehp] 4 5)
+)
 
-rx::eof
-
-(struct foo
+(struct foo2
   (blix i32)
   (gerp [i32 30]))
+
+rx::eof
 
 (template ((T K V) (move* T) (map* K V))
   (enum maybe
