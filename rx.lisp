@@ -1,12 +1,31 @@
 
 (ql:quickload :trivia)
 
+(declaim (optimize (debug 3)))
+
 (defpackage :rx
   (:use :cl :trivia :sb-mop))
 
 (defpackage :rx-kw
-  (:export :function :+ :- :return :prop :-> :struct
-           :i32))
+  (:export
+
+   :function
+
+   :+ :- :return :prop :-> :struct
+   :+ :- :/ :* :%
+   :&
+   := :== :!= :< :> :<= :>=
+   :>> :<<
+   :bor :band :bxor
+   :and :or
+
+   :while :if
+
+   :const
+
+   :void :i32
+
+   :block))
 
 (defpackage :rx-user
   (:use :rx-kw))
@@ -31,7 +50,7 @@
   (loop for ctx in *contexts* do
     (format *error-output* "    In ~a~%" ctx))
   (format *error-output* "~%")
-  (error "hi")
+  (error "~a" msg)
   ;(sb-ext:exit :code 1)
   )
 
@@ -65,22 +84,37 @@
   ((bits :type integer :accessor int-t/bits :initarg :bits)
    (signed :type boolean :accessor int-t/signed :initarg :signed)))
 
+(defclass ty.void-t (ty)
+  ())
+
 (defun ty-equal (a b)
   (assert (and a b))
   (match (list a b)
     ((list (ty.int-t (bits bits-1) (signed signed-1))
            (ty.int-t (bits bits-2) (signed signed-2)))
      (and (= bits-1 bits-2)
-          (eq signed-1 signed-2)))))
+          (eq signed-1 signed-2)))
+    ((list (typedesc.ref-desc :ref ref-1) (typedesc.ref-desc :ref ref-2))
+     (ty-equal ref-1 ref-2))))
+
+(defun ty-equal (a b)
+  (assert (and a b))
+  (match (list a b)
+    ((list (ty.int-t :bits bits-1 :signed signed-1)
+           (ty.int-t :bits bits-2 :signed signed-2))
+     (and (= bits-1 bits-2)
+          (eq signed-1 signed-2)))
+    ((list (typedesc.ref-desc :ref ref-1) (typedesc.ref-desc :ref ref-2))
+     (ty-equal ref-1 ref-2))))
 
 ;; TYPEDESC class
 
 (defclass typedesc ()
-  ())
+  ((const :type t :accessor typedesc/const :initarg :const :initform nil)))
 
 (defclass typedesc.func-desc (typedesc)
   ((ret-type :type typedesc :accessor func-desc/ret-type :initarg :ret-type)
-   (arg-types :type list :accessor func-desc/arg-types :initarg :arg-types)))
+   (param-types :type list :accessor func-desc/param-types :initarg :param-types)))
 
 (defclass typedesc.ref-desc (typedesc)
   ((name :type symbol :accessor ref-desc/name :initarg :name)
@@ -93,16 +127,6 @@
 (defclass typedesc.pointer-desc (typedesc)
   ((base-type :type typedesc :accessor pointer-desc/base-type :initarg :base-type)))
 
-(defun type/is-integral (obj)
-  (assert obj)
-  (match obj
-    ((ty.int-t)
-     obj)
-    ((typedesc.ref-desc :ref r)
-     (type/is-integral r))
-    ((ast.expression :type typ)
-     (type/is-integral typ))))
-
 ;; FORMAT-TYPE
 
 (defgeneric format-type (desc &optional child))
@@ -111,21 +135,23 @@
   ;; (format nil "~a~a~a" desc (if child " " "") (or child "")))
 
 (defmethod format-type ((type typedesc.func-desc) &optional child)
-  (with-slots (ret-type arg-types) type
+  (with-slots (ret-type param-types) type
     (if child
         (format nil "~a(~a)(~{~a~^ ,~})"
                 (format-type ret-type)
                 child
-                (mapcar #'format-type arg-types))
+                (mapcar #'format-type param-types))
         (format nil "~a(~{~a~^ ,~})"
                 (format-type ret-type)
-                (mapcar #'format-type arg-types)))))
+                (mapcar #'format-type param-types)))))
 
 (defmethod format-type ((type typedesc.ref-desc) &optional child)
-  (format nil "~a~a~a"
-          (ty/name (ref-desc/ref type))
-          (if child " " "")
-          (if child child "")))
+  (let ((const (typedesc/const type)))
+    (format nil "~a~a~a~a"
+            (ty/name (ref-desc/ref type))
+            (if const " const" "")
+            (if child " " "")
+            (if child child ""))))
 
 (defmethod format-type ((type typedesc.array-desc) &optional child)
   (with-slots (base-type dimms) type
@@ -136,7 +162,7 @@
 ;;; AST
 
 (defclass ast ()
-  ())
+  ((original-source :type t :accessor ast/original-source :initarg :original-source :initform nil)))
 
 (defclass ast.statement (ast)
   ((kind :type string :accessor statement/kind :initarg :kind)))
@@ -156,6 +182,18 @@
 (defclass ast.statement.return (ast.statement)
   ((body :type ast.expression :accessor return/body :initarg :body)))
 
+(defclass ast.statement.while (ast.statement)
+  ((condition :type ast.expression :accessor while/condition :initarg :condition)
+   (body :type list :accessor while/body :initarg :body)))
+
+(defclass ast.statement.compound (ast.statement)
+  ((statements :type list :accessor compound/statements :initarg :statements)))
+
+(defclass ast.statement.if (ast.statement)
+  ((condition :type ast.expression :accessor if/condition :initarg :condition)
+   (body :type ast.statement.compound :accessor if/body :initarg :body)
+   (else :type (or ast.statement.compound null) :accessor if/else :initarg :else)))
+
 (defclass ast.expression (ast)
   ((type :type typedesc :accessor expression/type :initarg :type :initform nil)))
 
@@ -168,14 +206,14 @@
 (defclass ast.expression.string (ast.expression)
   ((value :type symbol :accessor string/value :initarg :value)))
 
-(defclass ast.expression.unop (ast.expression)
-  ((op :type string :accessor unop/op :initarg :op)
-   (expr :type ast.expression :accessor unop/expr :initarg :expr)))
-
 (defclass ast.expression.binop (ast.expression)
   ((op :type string :accessor binop/op :initarg :op)
    (lhs :type ast.expression :accessor binop/lhs :initarg :lhs)
    (rhs :type ast.expression :accessor binop/rhs :initarg :rhs)))
+
+(defclass ast.expression.unop (ast.expression)
+  ((operator :type string :accessor unop/operator :initarg :operator)
+   (operand :type ast.expression :accessor unop/operand :initarg :operand)))
 
 (defclass ast.expression.funcall (ast.expression)
   ((target :type ast.expression :accessor funcall/target :initarg :target)
@@ -188,6 +226,36 @@
 (defclass ast.expression.array-sub (ast.expression)
   ((base :type ast.expression :accessor array-sub/base :initarg :base)
    (sub :type ast.expression :accessor array-sub/sub :initarg :sub)))
+
+(defun ast/is-lvalue (ast)
+  (match ast
+    ((or (ast.expression.identifier)
+         (ast.expression.unop :operator "*")
+         (ast.expression.array-sub))
+     t)
+    ((ast.expression.prop-access :base base)
+     (ast/is-lvalue base))))
+
+(defun type/is-integral (obj)
+  (assert obj)
+  (match obj
+    ((ty.int-t)
+     obj)
+    ((typedesc.ref-desc :ref r)
+     (type/is-integral r))
+    ((ast.expression :type typ)
+     (type/is-integral typ))))
+
+(defun type/is-pointer (obj)
+  (assert obj)
+
+  (match obj
+    ((typedesc.pointer-desc :base-type base)
+     base)
+    ((typedesc.ref-desc :ref r)
+     (type/is-pointer r))
+    ((ast.expression :type typ)
+     (type/is-pointer typ))))
 
 (defstruct function-arg
   name type)
@@ -202,6 +270,32 @@
   (assert (not toplevel))
 
   (format nil "return (~a)" (format-ast (return/body node))))
+
+(defmethod format-ast ((node ast.statement.compound) &optional toplevel)
+  (assert (not toplevel))
+
+  (format nil "{~%~{~a;~%~}}~%"
+          (mapcar #'format-ast (compound/statements node))))
+
+(defmethod format-ast ((node ast.statement.while) &optional toplevel)
+  (assert (not toplevel))
+
+  (format nil "while (~a) {~%~{~a;~%~}}"
+          (format-ast (while/condition node))
+          (mapcar #'format-ast (while/body node))))
+
+(defmethod format-ast ((node ast.statement.if) &optional toplevel)
+  (assert (not toplevel))
+
+  (with-slots (condition body else) node
+    (if else
+        (format nil "if (~a) { ~a; } else { ~a; }"
+                (format-ast condition)
+                (format-ast body)
+                (format-ast else))
+        (format nil "if (~a) { ~a };"
+                (format-ast condition)
+                (format-ast body)))))
 
 (defmethod format-ast ((node ast.expression.identifier) &optional toplevel)
   (assert (not toplevel))
@@ -248,37 +342,28 @@
                     collect (format-type field-type field-name))
               name))))
 
+(defmethod format-ast ((node ast.expression.unop) &optional toplevel)
+  (assert (not toplevel))
+
+  (with-slots (operand operator) node
+    (format nil "(~a(~a))"
+            operator
+            (format-ast operand))))
+
 (defmethod format-ast ((node ast.expression.binop) &optional toplevel)
   (assert (not toplevel))
 
   (with-slots (op lhs rhs) node
-    (format nil "(~a ~a ~a)" (format-ast lhs) op (format-ast rhs))))
+    (format nil "((~a)(~a ~a ~a))"
+            (format-type (expression/type node))
+            (format-ast lhs)
+            op
+            (format-ast rhs))))
 
 (defmethod format-ast ((node ast.expression.funcall) &optional toplevel)
   (declare (ignore toplevel))
   (with-slots (target args) node
     (format nil "(~a(~{~a~^, ~}))" (format-ast target) (mapcar #'format-ast args))))
-
-(defun binop-lassoc (name rest)
-  )
-
-(defmacro rx-kw:+ (&rest args)
- `(binop-lassoc "+" (list ,@args)))
-
-(defmacro rx-kw:- (&rest args)
- `(binop-lassoc "-" (list ,@args)))
-
-;(defun pretty-print-clos-object (object)
-;  (let* ((class (class-of object))
-;         (class-slots (sb-mop:class-slots class))
-;         (slot-names (mapcar #'sb-mop:slot-definition-name class-slots))
-;         (slot-values (mapcar (lambda (slot)
-;                                (slot-value object (sb-mop:slot-definition-name slot)))
-;                              class-slots)))
-;    (format t "~&~A~%" class)
-;    (loop for name in slot-names
-;          for value in slot-values
-;          do (format t "  ~A: ~A~%" name value))))
 
 (defun pretty-print-clos-object (object)
   (let* ((class (class-of object))
@@ -400,7 +485,10 @@
     (with-slots (lexenv) compiler
       (lexical-env.push lexenv
                         'rx-kw:i32
-                        (make-instance 'ty.int-t :name "int32_t" :bits 32 :signed t)))
+                        (make-instance 'ty.int-t :name "int32_t" :bits 32 :signed t))
+      (lexical-env.push lexenv
+                        'rx-kw:void
+                        (make-instance 'ty.void-t)))
     compiler))
 
 (defun compiler.parse-nary-op-to-binary-lassoc (compiler name ast1 ast2 rest)
@@ -412,18 +500,71 @@
         (compiler.parse-nary-op-to-binary-lassoc
          compiler
          name
-         (make-instance 'ast.expression.binop
-                        :op name
-                        :lhs ast1
-                        :rhs ast2)
+         expr
          (compiler.parse compiler (car rest))
          (cdr rest))
 
         expr)))
 
-(defun compiler.parse (compiler form)
+(defun compiler.parse-nary-op-to-binary-rassoc (compiler name ast1 ast2 rest)
+  (let ((expr (make-instance 'ast.expression.binop
+                             :op name
+                             :lhs ast2
+                             :rhs ast1)))
+    (if rest
+        (compiler.parse-nary-op-to-binary-rassoc
+         compiler
+         name
+         expr
+         (compiler.parse compiler (car rest))
+         (cdr rest))
+
+        expr)))
+
+(defun compiler.parse-unop (compiler op-name operand)
+  (make-instance 'ast.expression.unop
+                 :operator op-name
+                 :operand (compiler.parse compiler operand)))
+
+(defun compiler.parse-funcall (compiler fn args)
+  (make-instance 'ast.expression.funcall
+                 :target (compiler.parse compiler fn)
+                 :args (mapcar (bind #'compiler.parse compiler)
+                               args)))
+
+(defun compiler.parse-while (compiler condition body)
+  (let ((condition-ast (compiler.parse compiler condition)))
+    (let ((body-asts (mapcar (bind #'compiler.parse compiler)
+                             body)))
+      (make-instance 'ast.statement.while
+                     :kind "while"
+                     :condition condition-ast
+                     :body body-asts))))
+
+(defun compiler.parse-compound-statement (compiler stmts)
+  (make-instance 'ast.statement.compound
+                 :kind "compound"
+                 :statements (mapcar (bind #'compiler.parse compiler)
+                                     stmts)))
+
+(defun compiler.parse-if (compiler condition body else)
+  (make-instance 'ast.statement.if
+                 :kind "if"
+                 :condition (compiler.parse compiler condition)
+                 :body (compiler.parse compiler body)
+                 :else (when else (compiler.parse compiler else))))
+
+(defun compiler.parse* (compiler form)
   (with-slots (lexenv) compiler
     (ematch form
+      ((list 'rx-kw:if cond body else)
+       (compiler.parse-if compiler cond body else))
+      ((list 'rx-kw:if cond body)
+       (compiler.parse-if compiler cond body nil))
+      ((list* 'rx-kw:block stmts)
+       (compiler.parse-compound-statement compiler stmts))
+      ((list* 'rx-kw:while condition body)
+       (compiler.parse-while compiler condition body))
       ((list* 'rx-kw:function name args ret-type body)
        (compiler.parse-function compiler name args ret-type body))
       ((list* 'rx-kw:struct name types)
@@ -440,13 +581,37 @@
        (make-instance 'ast.expression.identifier :symbol form))
       ((type string)
        (make-instance 'ast.expression.string :value form))
-      ((list* (and op-name (or rx-kw:+)) arg1 arg2 rest)
+      ((list* (and op-name (or 'rx-kw:+ 'rx-kw:- 'rx-kw:/ 'rx-kw:* 'rx-kw:%
+                               'rx-kw:== 'rx-kw:!= 'rx-kw:< 'rx-kw:> 'rx-kw:<= 'rx-kw:>=
+                               'rx-kw:>> 'rx-kw:<<
+                               'rx-kw:bor 'rx-kw:band 'rx-kw:bxor
+                               'rx-kw:and 'rx-kw:or))
+              arg1 arg2 rest)
        (compiler.parse-nary-op-to-binary-lassoc
         compiler
         (symbol-name op-name)
         (compiler.parse compiler arg1)
         (compiler.parse compiler arg2)
-        rest)))))
+        rest))
+      ((list* (and op-name (or 'rx-kw:=))
+              arg1 arg2 rest)
+       (let ((reversed-args (reverse (list* arg1 arg2 rest))))
+         (compiler.parse-nary-op-to-binary-rassoc
+          compiler
+          (symbol-name op-name)
+          (compiler.parse compiler (car reversed-args))
+          (compiler.parse compiler (cadr reversed-args))
+          (cddr reversed-args))))
+      ((list (and op-name (or 'rx-kw:* 'rx-kw:&))
+              arg)
+       (compiler.parse-unop compiler (symbol-name op-name) arg))
+      ((list* fn args)
+       (compiler.parse-funcall compiler fn args)))))
+
+(defun compiler.parse (compiler form)
+  (let ((result (compiler.parse* compiler form)))
+    (setf (ast/original-source result) form)
+    result))
 
 (defun compiler.parse-prop (compiler base member)
   (ematch member
@@ -467,7 +632,12 @@
     ((list 'rx-kw:prop arr-type (and (type integer) bound))
      (make-instance 'ast.expression.array-sub
                     :base (compiler.parse-type compiler arr-type)
-                    :sub bound))))
+                    :sub bound))
+    ((list 'rx-kw:const x)
+     (make-instance 'ast.expression.funcall
+                    :target (make-instance 'ast.expression.identifier
+                                           :symbol 'rx-kw:const)
+                    :args (list (compiler.parse-type compiler x))))))
 
 (defun compiler.parse-struct (compiler name members)
   (typecheck name 'symbol)
@@ -536,35 +706,64 @@
           ((list ret-type)
            (make-instance 'typedesc.func-desc
                           :ret-type (compiler.ast-to-typedesc compiler ret-type)
-                          :arg-types nil))
+                          :param-types nil))
           ((type list)
            (make-instance 'typedesc.func-desc
                           :ret-type (compiler.ast-to-typedesc compiler (car (last args)))
-                          :arg-types (mapcar (bind #'compiler.ast-to-typedesc compiler) (butlast args))))))
+                          :param-types (mapcar (bind #'compiler.ast-to-typedesc compiler) (butlast args))))))
        ((ast.expression.prop-access :base array-type :member dimm)
         (typecheck dimm 'integer)
         (make-instance 'typedesc.array-desc
                        :base-type (compiler.ast-to-typedesc compiler array-type)
-                       :dimms dimm)))
+                       :dimms dimm))
+       ((ast.expression.funcall :target (ast.expression.identifier :symbol 'rx-kw:const)
+                                :args (list x))
+        (let ((typ (compiler.ast-to-typedesc compiler x)))
+          (setf (typedesc/const typ) t)
+          typ)))
      'typedesc)))
 
-(defun compiler.check-types-function (compiler ast)
+(defun compiler.check-types-funcall (compiler ast)
+  (with-slots (target args) ast
+    (compiler.check-types compiler target)
+    (mapc (bind #'compiler.check-types compiler) args)
+
+    (let ((target-type (expression/type target)))
+      (typecheck target-type 'typedesc.func-desc)
+
+      (with-slots (ret-type param-types) target-type
+        (unless (= (length args) (length param-types))
+          (error "~a expects ~a arguments, called with ~a"
+                 (format-ast target)
+                 (length param-types)
+                 (length args)))
+
+        (loop for param-type in param-types
+              for arg in args do
+              (check-ty-equal param-type (expression/type arg)))
+
+        (setf (expression/type ast) ret-type)))))
+
+(defun compiler.check-types-while (compiler ast)
   (with-lexical-env compiler
-    (with-slots (name args ret-type body) ast
-      (let ((arg-types
-              (loop for arg in args
-                    collect
-                    (ematch arg
-                      ((function-arg :name name :type typ)
-                       (typecheck name 'symbol)
-                       (lexical-env.push (compiler-lexenv compiler) name typ)
-                       typ)))))
-        (setf (function/type ast) (make-instance 'typedesc.func-desc
-                                                 :ret-type ret-type
-                                                 :arg-types arg-types))
-        (lexical-env.push (compiler-lexenv compiler) name (function/type ast))
-        (loop for stmt in body do
-              (compiler.check-types compiler stmt))))))
+    (with-slots (condition body) ast
+      (compiler.check-types compiler condition)
+
+      (assert (type/is-integral condition))
+
+      (mapc (bind #'compiler.check-types compiler) body))))
+
+(defun compiler.check-types-function (compiler ast)
+  (with-slots (name args ret-type body) ast
+    (setf (function/type ast) (make-instance 'typedesc.func-desc
+                                             :ret-type ret-type
+                                             :param-types (mapcar #'function-arg-type args)))
+    (lexical-env.push (compiler-lexenv compiler) name (function/type ast))
+    (with-lexical-env compiler
+      (loop for arg in args do
+        (with-slots (name type) arg
+          (lexical-env.push (compiler-lexenv compiler) name type)))
+      (mapc (bind #'compiler.check-types compiler) body))))
 
 (defun compiler.check-types-struct (compiler ast)
   (with-slots (name field-names field-types) ast
@@ -622,22 +821,91 @@
     (compiler.check-types compiler lhs)
     (compiler.check-types compiler rhs)
 
-    (let ((lhs-int (type/is-integral lhs))
-          (rhs-int (type/is-integral rhs)))
-      (unless (and lhs-int
-                   rhs-int
-                   (ty-equal lhs-int rhs-int))
-        (error "Type mismatch in operator ~a: Expression ~a and ~a are not integral or are different"
-               ast
-               lhs
-               rhs))
-      (setf (expression/type ast)
-            (expression/type lhs)))))
+    (ematch op
+      ("="
+       (unless (ast/is-lvalue lhs)
+         (error "Assignment ~a = ~a expects lvalue"
+                (ast/original-source lhs)
+                (ast/original-source rhs)))
+       (when (typedesc/const (expression/type lhs))
+         (error "Assignment of const in ~a = ~a"
+                (ast/original-source lhs)
+                (ast/original-source rhs)))
+       (unless (ty-equal (expression/type lhs) (expression/type rhs))
+         (error "In assignment ~a = ~a: type ~a cannot be converted to type ~a"
+                (ast/original-source lhs)
+                (ast/original-source rhs)
+                (format-type (expression/type rhs))
+                (format-type (expression/type lhs))))
+       (setf (expression/type ast)
+             (expression/type lhs)))
+      (_
+       (let ((lhs-int (type/is-integral lhs))
+             (rhs-int (type/is-integral rhs)))
+         (unless (and lhs-int
+                      rhs-int
+                      (ty-equal lhs-int rhs-int))
+           (error "Type mismatch in operator ~a: Expression ~a and ~a are not integral or are different"
+                  ast
+                  lhs
+                  rhs))
+         (setf (expression/type ast)
+               (expression/type lhs)))))))
+
+(defun compiler.check-types-compound (compiler ast)
+  (mapc (bind #'compiler.check-types compiler)
+        (compound/statements ast)))
+
+(defun compiler.check-types-if (compiler ast)
+  (with-slots (condition body else) ast
+    (compiler.check-types compiler condition)
+    (assert (type/is-integral condition))
+
+    (compiler.check-types compiler body)
+
+    (when else
+      (compiler.check-types compiler else))))
+
+(defun compiler.check-types-ptr-deref (compiler ast operand)
+  (compiler.check-types compiler operand)
+
+  (let ((deref-type (type/is-pointer (expression/type operand))))
+    (unless deref-type
+      (error "Unary * expects pointer type, got ~a in ~a"
+             (format-type (expression/type operand))
+             (ast/original-source ast)))
+    (setf (expression/type ast) deref-type)))
+
+(defun compiler.check-types-address-of (compiler ast operand)
+  (compiler.check-types compiler operand)
+
+  (let ((opnd-type (expression/type operand)))
+    (unless (ast/is-lvalue operand)
+      (error "Address-of operator expects lvalue in ~a"
+             (ast/original-source operand)))
+
+    (setf (expression/type ast)
+          (make-instance 'typedesc.pointer-desc
+                         :base-type opnd-type))))
+
+(defun compiler.check-types-unop (compiler ast)
+  (with-slots (operand operator) ast
+    (ematch operator
+      ("*"
+       (compiler.check-types-ptr-deref compiler ast operand))
+      ("&"
+       (compiler.check-types-address-of compiler ast operand)))))
 
 (defun compiler.check-types (compiler ast)
   (ematch ast
+    ((ast.statement.if)
+     (compiler.check-types-if compiler ast))
+    ((ast.statement.compound)
+     (compiler.check-types-compound compiler ast))
     ((ast.statement.function)
      (compiler.check-types-function compiler ast))
+    ((ast.statement.while)
+     (compiler.check-types-while compiler ast))
     ((ast.statement.struct)
      (compiler.check-types-struct compiler ast))
     ((ast.expression.prop-access :base base :member member)
@@ -647,7 +915,11 @@
     ((ast.expression.number)
      (compiler.check-types-number compiler ast))
     ((ast.expression.binop)
-     (compiler.check-types-binop compiler ast))))
+     (compiler.check-types-binop compiler ast))
+    ((ast.expression.funcall)
+     (compiler.check-types-funcall compiler ast))
+    ((ast.expression.unop)
+     (compiler.check-types-unop compiler ast))))
 
 (defun read-property-access (stream char)
   `(rx-kw:prop ,@(read-delimited-list #\] stream)))
@@ -669,7 +941,13 @@
                  (let ((ast (compiler.parse compiler x)))
                    (compiler.check-types compiler ast)
                    (format t "~a~%" (big-print-clos-object ast))
-                   (format t "~a~%" (format-ast ast t))))
+                   (format t "~a~%"
+                           (with-output-to-string (str)
+                             (sb-ext:run-program
+                              "/usr/bin/clang-format"
+                              '()
+                              :input (make-string-input-stream (format-ast ast t))
+                              :output str)))))
                                         ;    (loop for x across *output* do
                                         ;      (format t "~a~%" (pretty-print-clos-object x))
                                         ;      (format t "~a~%" (format-ast x t)))
