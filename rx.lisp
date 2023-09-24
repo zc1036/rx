@@ -19,7 +19,7 @@
    :bor :band :bxor
    :and :or
 
-   :while :if
+   :let :while :if
 
    :const
 
@@ -167,17 +167,21 @@
 (defclass ast.statement (ast)
   ((kind :type string :accessor statement/kind :initarg :kind)))
 
+(defstruct function-arg
+  name type-expr)
+
 (defclass ast.statement.function (ast.statement)
   ((name :type symbol :accessor function/name :initarg :name)
    (args :type list :accessor function/args :initarg :args)
-   (ret-type :type ty :accessor function/ret-type :initarg :ret-type)
+   (ret-type-expr :type ast :accessor function/ret-type-expr :initarg :ret-type-expr)
    (body :type list :accessor function/body :initarg :body)
-   (type :type ty :accessor function/type :initarg :type)))
+   (type :type typedesc.func-desc :accessor function/type)))
 
 (defclass ast.statement.struct (ast.statement)
   ((name :type symbol :accessor struct/name :initarg :name)
    (field-names :type list :accessor struct/field-names :initarg :field-names)
-   (field-types :type list :accessor struct/field-types :initarg :field-types)))
+   (field-type-exprs :type list :accessor struct/field-type-exprs :initarg :field-type-exprs)
+   (type :type ty.struct-t :accessor struct/type)))
 
 (defclass ast.statement.return (ast.statement)
   ((body :type ast.expression :accessor return/body :initarg :body)))
@@ -193,6 +197,12 @@
   ((condition :type ast.expression :accessor if/condition :initarg :condition)
    (body :type ast.statement.compound :accessor if/body :initarg :body)
    (else :type (or ast.statement.compound null) :accessor if/else :initarg :else)))
+
+(defclass ast.statement.var-def (ast.statement)
+  ((name :type symbol :accessor var-def/name :initarg :name)
+   (type-expr :type ast :accessor var-def/type :initarg :type-expr)
+   (init :type ast.expression :accessor var-def/init :initarg :init)
+   (type :type typedesc :accessor var-def/type)))
 
 (defclass ast.expression (ast)
   ((type :type typedesc :accessor expression/type :initarg :type :initform nil)))
@@ -257,9 +267,6 @@
     ((ast.expression :type typ)
      (type/is-pointer typ))))
 
-(defstruct function-arg
-  name type)
-
 (defgeneric format-ast (node &optional toplevel))
 
 (defmethod format-ast :before (node &optional toplevel)
@@ -283,6 +290,12 @@
   (format nil "while (~a) {~%~{~a;~%~}}"
           (format-ast (while/condition node))
           (mapcar #'format-ast (while/body node))))
+
+(defmethod format-ast ((node ast.statement.var-def) &optional toplevel)
+  (with-slots (name type init) node
+    (format nil "~a = ~a;"
+            (format-type type name)
+            (format-ast init))))
 
 (defmethod format-ast ((node ast.statement.if) &optional toplevel)
   (assert (not toplevel))
@@ -312,15 +325,13 @@
 (defmethod format-ast ((node ast.statement.function) &optional toplevel)
   (assert toplevel)
 
-  (with-slots (name args ret-type body) node
+  (with-slots (name args body type) node
     (with-output-to-string (str)
       (format str "~a ~a(~{~a~^, ~}) {~%"
-              (format-type ret-type)
+              (format-type (func-desc/ret-type type))
               name
-              (mapcar (lambda (arg)
-                        (with-slots (name type) arg
-                          (format-type type name)))
-                      args))
+              (loop for arg in args for arg-type in (func-desc/param-types type)
+                    collect (format-type arg-type (function-arg-name arg))))
       (loop for n in body do
         (format str "  ~a;~%" (format-ast n)))
       (format str "}~%"))))
@@ -334,7 +345,7 @@
 (defmethod format-ast ((node ast.statement.struct) &optional toplevel)
   (assert toplevel)
 
-  (with-slots (name field-names field-types) node
+  (with-slots (name field-names field-types) (struct/type node)
     (with-output-to-string (str)
       (format str "typedef struct ~a {~%~{~a;~%~}} ~a;~%"
               name
@@ -554,9 +565,20 @@
                  :body (compiler.parse compiler body)
                  :else (when else (compiler.parse compiler else))))
 
+(defun compiler.parse-let (compiler name-sym type-decl init)
+  (typecheck name-sym 'symbol)
+
+  (make-instance 'ast.statement.var-def
+                 :kind "let"
+                 :name name-sym
+                 :type-expr (compiler.parse-type compiler type-decl)
+                 :init (compiler.parse compiler init)))
+
 (defun compiler.parse* (compiler form)
   (with-slots (lexenv) compiler
     (ematch form
+      ((list 'rx-kw:let name type init)
+       (compiler.parse-let compiler name type init))
       ((list 'rx-kw:if cond body else)
        (compiler.parse-if compiler cond body else))
       ((list 'rx-kw:if cond body)
@@ -656,11 +678,8 @@
                      :kind "struct"
                      :name name
                      :field-names field-names
-                     :field-types (mapcar (lambda (x)
-                                            (compiler.ast-to-typedesc
-                                             compiler
-                                             (compiler.parse-type compiler x)))
-                                          field-types)))))
+                     :field-type-exprs (mapcar (bind #'compiler.parse-type compiler)
+                                               field-types)))))
 
 (defun compiler.parse-function (compiler name args ret-type body)
   (typecheck name 'symbol)
@@ -675,14 +694,14 @@
 
                                      (make-function-arg
                                       :name arg-name
-                                      :type (compiler.ast-to-typedesc compiler (compiler.parse-type compiler arg-type)))))))
-          (ret-type (compiler.ast-to-typedesc compiler (compiler.parse-type compiler ret-type)))
+                                      :type-expr (compiler.parse-type compiler arg-type))))))
+          (ret-type-expr (compiler.parse-type compiler ret-type))
           (parsed-body (mapcar (lambda (stmt) (compiler.parse compiler stmt)) body)))
       (make-instance 'ast.statement.function
                      :kind "function"
                      :name name
                      :args arg-structs
-                     :ret-type ret-type
+                     :ret-type-expr ret-type-expr
                      :body parsed-body))))
 
 ;; ((ast.expression.number)
@@ -723,6 +742,18 @@
           typ)))
      'typedesc)))
 
+(defun compiler.check-types-var-def (compiler ast)
+  (with-slots (name type-expr init) ast
+    (compiler.check-types compiler init)
+    (setf (var-def/type ast) (compiler.ast-to-typedesc compiler type-expr))
+    (unless (ty-equal (var-def/type ast) (expression/type init))
+      (error "In assignment ~a cannot convert ~a from type ~a to type ~a"
+             (ast/original-source ast)
+             (ast/original-source init)
+             (format-type (expression/type init))
+             (format-type (var-def/type ast))))
+    (lexical-env.push (compiler-lexenv compiler) name (var-def/type ast))))
+
 (defun compiler.check-types-funcall (compiler ast)
   (with-slots (target args) ast
     (compiler.check-types compiler target)
@@ -739,8 +770,8 @@
                  (length args)))
 
         (loop for param-type in param-types
-              for arg in args do
-              (check-ty-equal param-type (expression/type arg)))
+              for arg in args
+              do (check-ty-equal param-type (expression/type arg)))
 
         (setf (expression/type ast) ret-type)))))
 
@@ -754,25 +785,31 @@
       (mapc (bind #'compiler.check-types compiler) body))))
 
 (defun compiler.check-types-function (compiler ast)
-  (with-slots (name args ret-type body) ast
+  (with-slots (name args ret-type-expr body) ast
     (setf (function/type ast) (make-instance 'typedesc.func-desc
-                                             :ret-type ret-type
-                                             :param-types (mapcar #'function-arg-type args)))
+                                             :ret-type (compiler.ast-to-typedesc compiler ret-type-expr)
+                                             :param-types (mapcar (lambda (arg)
+                                                                    (compiler.ast-to-typedesc compiler (function-arg-type-expr arg)))
+                                                                  args)))
     (lexical-env.push (compiler-lexenv compiler) name (function/type ast))
     (with-lexical-env compiler
-      (loop for arg in args do
-        (with-slots (name type) arg
-          (lexical-env.push (compiler-lexenv compiler) name type)))
+      (loop for arg-type in (func-desc/param-types (function/type ast))
+            for arg in args do
+              (lexical-env.push (compiler-lexenv compiler)
+                                (function-arg-name arg)
+                                arg-type))
       (mapc (bind #'compiler.check-types compiler) body))))
 
 (defun compiler.check-types-struct (compiler ast)
-  (with-slots (name field-names field-types) ast
-    (lexical-env.push (compiler-lexenv compiler)
-                      name
-                      (make-instance 'ty.struct-t
-                                     :name name
-                                     :field-names field-names
-                                     :field-types field-types))))
+  (with-slots (name field-names field-type-exprs) ast
+    (let ((struct-t (make-instance 'ty.struct-t
+                                   :name name
+                                   :field-names field-names
+                                   :field-types (mapcar
+                                                 (bind #'compiler.ast-to-typedesc compiler)
+                                                 field-type-exprs))))
+      (setf (struct/type ast) struct-t)
+      (lexical-env.push (compiler-lexenv compiler) name struct-t))))
 
 (defun compiler.check-types-struct-member-access (compiler ast base member-sym)
   (setf (expression/type ast)
@@ -898,6 +935,8 @@
 
 (defun compiler.check-types (compiler ast)
   (ematch ast
+    ((ast.statement.var-def)
+     (compiler.check-types-var-def compiler ast))
     ((ast.statement.if)
      (compiler.check-types-if compiler ast))
     ((ast.statement.compound)

@@ -13,14 +13,18 @@
 
           (= [blah'fehp] 3)
 
-  (while 0
-         1)
+          (let foop i32 0)
 
-  (fef 1 2)
+          (= foop 1)
 
-  (if 1
-    (block 2 3 4)
-    3))
+          (while 0
+                 1)
+
+          (fef 1 2)
+
+          (if 1
+              (block 2 3 4)
+              3))
 
 (struct foo2
   (blix i32)
