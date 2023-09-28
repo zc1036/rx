@@ -3,10 +3,10 @@
   (feh i32)
   (fehp i32))
 
-(function fef ((a i32) (b i32)) i32
+(function fef ((a (const i32)) (b i32)) i32
           (- a b)
 
-          (= a a 1))
+          (= b (+ a 1)))
 
 (function a ((blah (const foo))) i32
           (- [blah'fehp] (+ 4 5))
@@ -21,6 +21,8 @@
                  1)
 
           (fef 1 2)
+
+          (let str (* [ (const char) 3 ])  "hi")
 
           (if 1
               (block 2 3 4)
