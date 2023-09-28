@@ -219,7 +219,9 @@
   ((symbol :type symbol :accessor identifier/symbol :initarg :symbol)))
 
 (defclass ast.expression.number (ast.expression)
-  ((value :type number :accessor number/value :initarg :value)))
+  ((value :type number :accessor number/value :initarg :value)
+   (bits :type (or number null) :accessor number/bits :initarg :bits)
+   (signed :type t :accessor number/signed :initarg :signed)))
 
 (defclass ast.expression.string-literal (ast.expression)
   ((value :type string :accessor string-literal/value :initarg :value)))
@@ -264,6 +266,11 @@
     ((ast.expression :type typ)
      (type/is-integral typ))))
 
+(defun type/is-array (obj)
+  (assert obj)
+
+  (typep obj 'typedesc.array-desc))
+
 (defun type/is-pointer (obj)
   (assert obj)
 
@@ -302,7 +309,7 @@
 (defmethod format-ast ((node ast.statement.var-def) &optional toplevel)
   (with-slots (name type init) node
     (format nil "~a = ~a;"
-            (format-type type name)
+            (format-type type (symbol-name name))
             (format-ast init))))
 
 (defmethod format-ast ((node ast.statement.if) &optional toplevel)
@@ -342,7 +349,7 @@
               (format-type (func-desc/ret-type type))
               name
               (loop for arg in args for arg-type in (func-desc/param-types type)
-                    collect (format-type arg-type (function-arg-name arg))))
+                    collect (format-type arg-type (symbol-name (function-arg-name arg)))))
       (loop for n in body do
         (format str "  ~a;~%" (format-ast n)))
       (format str "}~%"))))
@@ -352,6 +359,12 @@
 
   (with-slots (base member) node
     (format nil "(~a.~a)" (format-ast base) member)))
+
+(defmethod format-ast ((node ast.expression.array-sub) &optional toplevel)
+  (assert (not toplevel))
+
+  (with-slots (base sub) node
+    (format nil "(~a[~a])" (format-ast base) (format-ast sub))))
 
 (defmethod format-ast ((node ast.statement.struct) &optional toplevel)
   (assert toplevel)
@@ -609,14 +622,20 @@
        ($ ast.statement.return
           :kind "return"
           :body (compiler.parse compiler expr)))
-      ((list 'rx-kw:prop base member)
-       (compiler.parse-prop compiler base member))
+      ((list* 'rx-kw:prop base member1 members)
+       (compiler.parse-prop compiler (compiler.parse compiler base) (cons member1 members)))
+      ((list* 'rx-kw:prop _)
+       (error "Invalid prop syntax"))
+      ((type character)
+       ($ ast.expression.number :value (char-int form) :bits 8 :signed t))
       ((type integer)
-       ($ ast.expression.number :value form))
+       ($ ast.expression.number :value form :bits 32 :signed nil))
       ((type string)
        ($ ast.expression.string-literal :value form))
       ((type symbol)
        ($ ast.expression.identifier :symbol form))
+      ((type character)
+       ($ ast.expression.character :value form))
       ((list* (and op-name (or 'rx-kw:+ 'rx-kw:- 'rx-kw:/ 'rx-kw:* 'rx-kw:%
                                'rx-kw:== 'rx-kw:!= 'rx-kw:< 'rx-kw:> 'rx-kw:<= 'rx-kw:>=
                                'rx-kw:>> 'rx-kw:<<
@@ -649,16 +668,24 @@
     (setf (ast/original-source result) form)
     result))
 
-(defun compiler.parse-prop (compiler base member)
-  (ematch member
-    ((list 'quote mbr-sym)
-     ($ ast.expression.prop-access
-        :base (compiler.parse compiler base)
-        :member mbr-sym))
-    ((integer)
-     ($ ast.expression.array-sub
-        :base (compiler.parse compiler base)
-        :sub member))))
+(defun compiler.parse-prop (compiler base members)
+  (ematch members
+    (nil
+     base)
+    ((list* (list 'quote mbr-sym) rest)
+     (compiler.parse-prop
+      compiler
+      ($ ast.expression.prop-access
+        :base base
+        :member mbr-sym)
+      rest))
+    ((list* (and member (integer)) rest)
+     (compiler.parse-prop
+      compiler
+      ($ ast.expression.array-sub
+        :base base
+        :sub (compiler.parse compiler member))
+      rest))))
 
 (defun compiler.parse-type (compiler typ)
   "form -> AST"
@@ -793,7 +820,12 @@
 
         (loop for param-type in param-types
               for arg in args
-              do (check-ty-equal param-type (expression/type arg)))
+              do (unless (ty-equal param-type (expression/type arg))
+                   (error "In function call ~a can't convert from argument ~a type ~a to parameter type ~a"
+                          (ast/original-source ast)
+                          (format-ast arg)
+                          (format-type (expression/type arg))
+                          (format-type param-type ))))
 
         (setf (expression/type ast) ret-type)))))
 
@@ -868,24 +900,32 @@
   (setf (expression/type ast) (compiler.lookup-symbol-type compiler (identifier/symbol ast))))
 
 (defun compiler.check-types-number (compiler ast)
-  (setf (expression/type ast)
-        ($ typedesc.ref-desc
-           :name "int32_t"
-           :ref (lexical-env.lookup-or-error
-                 (compiler-lexenv compiler)
-                 'rx-kw:i32))))
+  (with-slots (signed bits) ast
+    (setf (expression/type ast)
+          (ematch (list signed bits)
+            ((list _ 32)
+             ($ typedesc.ref-desc
+                :name (format nil "~aint32_t" (if signed "" "u"))
+                :ref (lexical-env.lookup-or-error
+                      (compiler-lexenv compiler)
+                      'rx-kw:i32)))
+            ((list t 8)
+             ($ typedesc.ref-desc
+                :name "char"
+                :ref (lexical-env.lookup-or-error
+                      (compiler-lexenv compiler)
+                      'rx-kw:char)))))))
 
 (defun compiler.check-types-string-literal (compiler ast)
   (setf (expression/type ast)
-        ($ typedesc.pointer-desc
-           :base-type ($ typedesc.array-desc
-                         :dimms (list (1+ (length (string-literal/value ast))))
-                         :base-type (typedesc-make-const
-                                     ($ typedesc.ref-desc
-                                        :name "char"
-                                        :ref (lexical-env.lookup-or-error
-                                              (compiler-lexenv compiler)
-                                              'rx-kw:char)))))))
+        ($ typedesc.array-desc
+           :dimms (list (1+ (length (string-literal/value ast))))
+           :base-type (typedesc-make-const
+                       ($ typedesc.ref-desc
+                          :name "char"
+                          :ref (lexical-env.lookup-or-error
+                                (compiler-lexenv compiler)
+                                'rx-kw:char))))))
 
 (defun compiler.check-types-binop (compiler ast)
   (with-slots (op lhs rhs) ast
@@ -902,8 +942,11 @@
          (error "Assignment of const in ~a = ~a"
                 (ast/original-source lhs)
                 (ast/original-source rhs)))
+       (when (type/is-array (expression/type lhs))
+         (error "In assignment ~A cannot assign to expression of array type"
+                (ast/original-source ast)))
        (unless (ty-equal (expression/type lhs) (expression/type rhs))
-         (error "In assignment ~a = ~a: type ~a cannot be converted to type ~a"
+         (error "In assignment ~s = ~s: type ~a cannot be converted to type ~a"
                 (ast/original-source lhs)
                 (ast/original-source rhs)
                 (format-type (expression/type rhs) "x")
@@ -966,8 +1009,23 @@
       ("&"
        (compiler.check-types-address-of compiler ast operand)))))
 
+(defun compiler.check-types-array-sub (compiler ast)
+  (with-slots (base sub) ast
+    (compiler.check-types compiler base)
+    (compiler.check-types compiler sub)
+
+    (ematch (expression/type base)
+      ((or (typedesc.pointer-desc :base-type base) (typedesc.array-desc :base-type base))
+       (setf (expression/type ast) base))
+      (_
+       (error "In array subscript ~a invalid type"
+              (ast/original-source ast)
+              (format-type (expression/type base)))))))
+
 (defun compiler.check-types (compiler ast)
   (ematch ast
+    ((ast.expression.array-sub)
+     (compiler.check-types-array-sub compiler ast))
     ((ast.expression.string-literal)
      (compiler.check-types-string-literal compiler ast))
     ((ast.statement.var-def)

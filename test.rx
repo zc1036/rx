@@ -8,7 +8,7 @@
 
           (= b (+ a 1)))
 
-(function a ((blah (const foo))) i32
+(function a ((blah (const foo)) (nerp [ foo 4 ])) i32
           (- [blah'fehp] (+ 4 5))
 
           (= [blah'fehp] 3)
@@ -22,7 +22,12 @@
 
           (fef 1 2)
 
-          (let str (* [ (const char) 3 ])  "hi")
+          (let str [ (const char) 3 ]  "hi")
+
+          (= str "hi")
+
+          (= [nerp 0'feh] 4)
+
 
           (if 1
               (block 2 3 4)
