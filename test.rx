@@ -1,14 +1,20 @@
 
 (struct foo
-  (feh i32)
-  (fehp i32))
+        (feh i32)
+        (fehp i32))
 
-(function fef ((a (const i32)) (b i32)) i32
-          (- a b)
+(struct fefefe
+        (myfoo foo))
 
-          (= b (+ a 1)))
+(function fef ((a (* (const i32))) (b (* i32))) i32
+          (= (* b) (* a)))
 
-(function a ((blah (const foo)) (nerp [ foo 4 ])) i32
+(function asdf () i32
+          (let asdf (* (-> (* (const i32)) (* i32) i32)) (& fef))
+
+          (= asdf (& fef)))
+
+(function a ((blah (const foo))) i32
           (- [blah'fehp] (+ 4 5))
 
           (= [blah'fehp] 3)
@@ -20,14 +26,7 @@
           (while 0
                  1)
 
-          (fef 1 2)
-
           (let str [ (const char) 3 ]  "hi")
-
-          (= str "hi")
-
-          (= [nerp 0'feh] 4)
-
 
           (if 1
               (block 2 3 4)
@@ -37,7 +36,7 @@
   (blix i32)
   (gerp [i32 30]))
 
-rx::eof
+RX::EOF
 
 (template ((T K V) (move* T) (map* K V))
   (enum maybe

@@ -9,23 +9,24 @@
 (defpackage :rx-kw
   (:export
 
-   :function
+   :|function|
 
-   :+ :- :return :prop :-> :struct
+   :+ :- :|return| :|prop| :-> :|struct|
    :+ :- :/ :* :%
    :&
    := :== :!= :< :> :<= :>=
    :>> :<<
-   :bor :band :bxor
-   :and :or
+   :|bor| :|band| :|bxor|
+   :|and| :|or|
 
-   :let :while :if
+   :|let| :|while| :|if|
 
-   :const
+   :|const|
 
-   :void :i32 :char
+   :|void| :|i32| :|i8| :|i16| :|i64| :|char|
+   :|u8| :|u16| :|u32| :|u64|
 
-   :block))
+   :|block|))
 
 (defpackage :rx-user
   (:use :rx-kw))
@@ -65,6 +66,11 @@
              v ty (type-of v))))
   v)
 
+(defun internal-check (v &rest msg)
+  (unless v
+    (apply #'error msg))
+  v)
+
 (defun arg-to-string (arg)
   (ematch arg
           ((list name type)
@@ -87,26 +93,11 @@
   ((bits :type integer :accessor int-t/bits :initarg :bits)
    (signed :type boolean :accessor int-t/signed :initarg :signed)))
 
-(defclass ty.void-t (ty)
+(defclass ty.char-t (ty)
   ())
 
-(defun ty-equal (a b)
-  (assert (and a b))
-  (match (list a b)
-    ((list (ty.int-t (bits bits-1) (signed signed-1))
-           (ty.int-t (bits bits-2) (signed signed-2)))
-     (and (= bits-1 bits-2)
-          (eq signed-1 signed-2)))
-    ((list (typedesc.ref-desc (ref ref-1)) (typedesc.ref-desc (ref ref-2)))
-     (ty-equal ref-1 ref-2))
-    ((list (typedesc.pointer-desc (base-type base-1))
-           (typedesc.pointer-desc (base-type base-2)))
-     (ty-equal base-1 base-2))
-    ((list (typedesc.array-desc (dimms dimms-1) (base-type base-1))
-           (typedesc.array-desc (dimms dimms-2) (base-type base-2)))
-     (and (= (length dimms-1) (length dimms-2))
-          (equal dimms-1 dimms-2)
-          (ty-equal base-1 base-2)))))
+(defclass ty.void-t (ty)
+  ())
 
 ;; TYPEDESC class
 
@@ -128,9 +119,19 @@
 (defclass typedesc.pointer-desc (typedesc)
   ((base-type :type typedesc :accessor pointer-desc/base-type :initarg :base-type)))
 
+(defun shallow-copy-object (original)
+  (let* ((class (class-of original))
+         (copy (allocate-instance class)))
+    (dolist (slot (mapcar #'slot-definition-name (class-slots class)))
+      (when (slot-boundp original slot)
+        (setf (slot-value copy slot)
+              (slot-value original slot))))
+    copy))
+
 (defun typedesc-make-const (td)
-  (setf (typedesc/const td) t)
-  td)
+  (let ((copy (shallow-copy-object td)))
+    (setf (typedesc/const copy) t)
+    copy))
 
 ;; FORMAT-TYPE
 
@@ -218,6 +219,9 @@
 (defclass ast.expression.identifier (ast.expression)
   ((symbol :type symbol :accessor identifier/symbol :initarg :symbol)))
 
+(defclass ast.expression.character (ast.expression)
+  ((value :type character :accessor character/value :initarg :value)))
+
 (defclass ast.expression.number (ast.expression)
   ((value :type number :accessor number/value :initarg :value)
    (bits :type (or number null) :accessor number/bits :initarg :bits)
@@ -247,6 +251,9 @@
   ((base :type ast.expression :accessor array-sub/base :initarg :base)
    (sub :type ast.expression :accessor array-sub/sub :initarg :sub)))
 
+(defun ast/original-source-string (ast)
+  (write-to-string (ast/original-source ast) :readably nil))
+
 (defun ast/is-lvalue (ast)
   (match ast
     ((or (ast.expression.identifier)
@@ -255,6 +262,40 @@
      t)
     ((ast.expression.prop-access :base base)
      (ast/is-lvalue base))))
+
+(defun type/assignable-to (a b &optional check-const)
+  (assert (and a b))
+
+  (match (list a b)
+    ((list (ty.int-t (bits bits-1) (signed signed-1))
+           (ty.int-t (bits bits-2) (signed signed-2)))
+     (and (= bits-1 bits-2)
+          (eq signed-1 signed-2)))
+    ((list (ty.char-t) (ty.char-t))
+     t)
+    ((list (typedesc.ref-desc :ref ref-1 :const const-1)
+           (typedesc.ref-desc :ref ref-2 :const const-2))
+     (and (or (not check-const)
+              (eq const-1 const-2))
+          (type/assignable-to ref-1 ref-2 t)))
+    ((list (typedesc.pointer-desc :base-type base-1 :const const-1)
+           (typedesc.pointer-desc :base-type base-2 :const const-2))
+     (and (or (not check-const)
+              (eq const-1 const-2))
+          (type/assignable-to base-1 base-2 t)))
+    ((list (typedesc.array-desc :dimms dimms-1 :base-type base-1 :const const-1)
+           (typedesc.array-desc :dimms dimms-2 :base-type base-2 :const const-2))
+     (and (or (not check-const)
+              (eq const-1 const-2))
+          (= (length dimms-1) (length dimms-2))
+          (equal dimms-1 dimms-2)
+          (type/assignable-to base-1 base-2 t)))
+    ((list (typedesc.func-desc :ret-type ret-type-1 :param-types ptypes-1)
+           (typedesc.func-desc :ret-type ret-type-2 :param-types ptypes-2))
+     (and (= (length ptypes-1) (length ptypes-2))
+          (type/assignable-to ret-type-1 ret-type-2)
+          (loop for p1 in ptypes-1 for p2 in ptypes-2
+                always (type/assignable-to p1 p2))))))
 
 (defun type/is-integral (obj)
   (assert obj)
@@ -270,6 +311,11 @@
   (assert obj)
 
   (typep obj 'typedesc.array-desc))
+
+(defun type/is-func (obj)
+  (assert obj)
+
+  (typep obj 'typedesc.func-desc))
 
 (defun type/is-pointer (obj)
   (assert obj)
@@ -336,6 +382,11 @@
   (format nil "((~a)~a)"
           (ty/name (ref-desc/ref (expression/type node)))
           (number/value node)))
+
+(defmethod format-ast ((node ast.expression.character) &optional toplevel)
+  (assert (not toplevel))
+
+  (format nil "'~a'" (character/value)))
 
 (defmethod format-ast ((node ast.expression.string-literal) &optional toplevel)
   (format nil "~s" (string-literal/value node)))
@@ -515,18 +566,67 @@
 (defstruct compiler
   lexenv)
 
+(defparameter *i8*
+  ($ ty.int-t :name "int8_t" :bits 8 :signed t))
+(defparameter *i16*
+  ($ ty.int-t :name "int16_t" :bits 16 :signed t))
+(defparameter *i32*
+  ($ ty.int-t :name "int32_t" :bits 32 :signed t))
+(defparameter *i64*
+  ($ ty.int-t :name "int64_t" :bits 64 :signed t))
+
+(defparameter *bitsize-to-signed-type*
+  (list (cons 8 *i8*)
+        (cons 16 *i16*)
+        (cons 32 *i32*)
+        (cons 64 *i64*)))
+
+(defparameter *u8*
+  ($ ty.int-t :name "uint8_t" :bits 8 :signed nil))
+(defparameter *u16*
+  ($ ty.int-t :name "uint16_t" :bits 16 :signed nil))
+(defparameter *u32*
+  ($ ty.int-t :name "uint32_t" :bits 32 :signed nil))
+(defparameter *u64*
+  ($ ty.int-t :name "uint64_t" :bits 64 :signed nil))
+
+(defparameter *bitsize-to-unsigned-type*
+  (list (cons 8 *u8*)
+        (cons 16 *u16*)
+        (cons 32 *u32*)
+        (cons 64 *u64*)))
+
+(defparameter *char*
+  ($ ty.char-t :name "char"))
+
+(defparameter *void*
+  ($ ty.void-t :name "void"))
+
+(defparameter *symbol-to-int-type*
+  (list (list 'rx-kw:|i8| *i8*)
+        (list 'rx-kw:|i16| *i16*)
+        (list 'rx-kw:|i32| *i32*)
+        (list 'rx-kw:|i64| *i64*)
+        (list 'rx-kw:|u8| *u8*)
+        (list 'rx-kw:|u16| *u16*)
+        (list 'rx-kw:|u32| *u32*)
+        (list 'rx-kw:|u64| *u64*)))
+
 (defun new-compiler ()
   (let ((compiler (make-compiler :lexenv (new-lexical-env))))
     (with-slots (lexenv) compiler
+      (loop for (sym typ) in *symbol-to-int-type*
+            do (lexical-env.push lexenv sym ($ typedesc.ref-desc
+                                               :name (ty/name typ)
+                                               :ref typ)))
+
       (lexical-env.push lexenv
-                        'rx-kw:i32
-                        ($ ty.int-t :name "int32_t" :bits 32 :signed t))
+                        'rx-kw:|char|
+                        *char*)
+
       (lexical-env.push lexenv
-                        'rx-kw:char
-                        ($ ty.int-t :name "char" :bits 8 :signed t))
-      (lexical-env.push lexenv
-                        'rx-kw:void
-                        ($ ty.void-t)))
+                        'rx-kw:|void|
+                        *void*))
     compiler))
 
 (defun compiler.parse-nary-op-to-binary-lassoc (compiler name ast1 ast2 rest)
@@ -604,43 +704,51 @@
 (defun compiler.parse* (compiler form)
   (with-slots (lexenv) compiler
     (ematch form
-      ((list 'rx-kw:let name type init)
+      ((list 'rx-kw:|let| name type init)
        (compiler.parse-let compiler name type init))
-      ((list 'rx-kw:if cond body else)
+      ((list* 'rx-kw:|let| _)
+       (error "Invalid syntax in let"))
+      ((list 'rx-kw:|if| cond body else)
        (compiler.parse-if compiler cond body else))
-      ((list 'rx-kw:if cond body)
+      ((list 'rx-kw:|if| cond body)
        (compiler.parse-if compiler cond body nil))
-      ((list* 'rx-kw:block stmts)
+      ((list* 'rx-kw:|block| stmts)
        (compiler.parse-compound-statement compiler stmts))
-      ((list* 'rx-kw:while condition body)
+      ((list* 'rx-kw:|while| condition body)
        (compiler.parse-while compiler condition body))
-      ((list* 'rx-kw:function name args ret-type body)
+      ((list* 'rx-kw:|function| name args ret-type body)
        (compiler.parse-function compiler name args ret-type body))
-      ((list* 'rx-kw:struct name types)
+      ((list* 'rx-kw:|struct| name types)
        (compiler.parse-struct compiler name types))
-      ((list 'rx-kw:return expr)
+      ((list 'rx-kw:|return| expr)
        ($ ast.statement.return
           :kind "return"
           :body (compiler.parse compiler expr)))
-      ((list* 'rx-kw:prop base member1 members)
+      ((list* 'rx-kw:|prop| base member1 members)
        (compiler.parse-prop compiler (compiler.parse compiler base) (cons member1 members)))
-      ((list* 'rx-kw:prop _)
+      ((list* 'rx-kw:|prop| _)
        (error "Invalid prop syntax"))
       ((type character)
-       ($ ast.expression.number :value (char-int form) :bits 8 :signed t))
+       ($ ast.expression.character :value form))
       ((type integer)
-       ($ ast.expression.number :value form :bits 32 :signed nil))
+       (if (> form #xFFFFFFFFFFFFFFFF)
+           (error "Integer ~a too large to fit in 64 bits" form)
+           (if (> form #x7FFFFFFFFFFFFFFF)
+               ($ ast.expression.number :value form :bits 64 :signed nil)
+               (if (> form #xFFFFFFFF)
+                   ($ ast.expression.number :value form :bits 64 :signed t)
+                   (if (> form #x7FFFFFFF)
+                       ($ ast.expression.number :value form :bits 32 :signed nil)
+                       ($ ast.expression.number :value form :bits 32 :signed t))))))
       ((type string)
        ($ ast.expression.string-literal :value form))
       ((type symbol)
        ($ ast.expression.identifier :symbol form))
-      ((type character)
-       ($ ast.expression.character :value form))
       ((list* (and op-name (or 'rx-kw:+ 'rx-kw:- 'rx-kw:/ 'rx-kw:* 'rx-kw:%
                                'rx-kw:== 'rx-kw:!= 'rx-kw:< 'rx-kw:> 'rx-kw:<= 'rx-kw:>=
                                'rx-kw:>> 'rx-kw:<<
-                               'rx-kw:bor 'rx-kw:band 'rx-kw:bxor
-                               'rx-kw:and 'rx-kw:or))
+                               'rx-kw:|bor| 'rx-kw:|band| 'rx-kw:|bxor|
+                               'rx-kw:|and| 'rx-kw:|or|))
               arg1 arg2 rest)
        (compiler.parse-nary-op-to-binary-lassoc
         compiler
@@ -692,7 +800,7 @@
   (ematch typ
     ((type symbol)
      ($ ast.expression.identifier :symbol typ))
-    ((list 'rx-kw:prop arr-type (and (type integer) bound))
+    ((list 'rx-kw:|prop| arr-type (and (type integer) bound))
      ($ ast.expression.array-sub
         :base (compiler.parse-type compiler arr-type)
         :sub bound))
@@ -701,11 +809,19 @@
         :target ($ ast.expression.identifier
                    :symbol 'rx-kw:*)
         :args (list (compiler.parse-type compiler x))))
-    ((list 'rx-kw:const x)
+    ((list* 'rx-kw:-> type1 rest)
      ($ ast.expression.funcall
         :target ($ ast.expression.identifier
-                   :symbol 'rx-kw:const)
-        :args (list (compiler.parse-type compiler x))))))
+                   :symbol 'rx-kw:->)
+        :args (mapcar (bind #'compiler.parse-type compiler)
+                      (cons type1 rest))))
+    ((list 'rx-kw:|const| x)
+     ($ ast.expression.funcall
+        :target ($ ast.expression.identifier
+                   :symbol 'rx-kw:|const|)
+        :args (list (compiler.parse-type compiler x))))
+    (_
+     (error "Syntax error in type specification ~a" typ))))
 
 (defun compiler.parse-struct (compiler name members)
   (typecheck name 'symbol)
@@ -761,12 +877,15 @@
        ((ast.expression.identifier :symbol name)
         (ematch (lexical-env.lookup-or-error lexenv name)
           ((and typ (ty :name name))
-           ($ typedesc.ref-desc :name name :ref typ))))
+           ($ typedesc.ref-desc :name name :ref typ))
+          ((and typ (typedesc))
+           typ)))
        ((ast.expression.array-sub :base (and (ast) base-type) :sub (and (type integer) bound))
         ($ typedesc.array-desc
            :base-type (compiler.ast-to-typedesc compiler base-type)
            :dimms (list bound)))
-       ((ast.expression.funcall :target 'rx-kw:-> :args args)
+       ((ast.expression.funcall :target (ast.expression.identifier :symbol 'rx-kw:->)
+                                :args args)
         (ematch args
           ((list ret-type)
            ($ typedesc.func-desc
@@ -781,11 +900,9 @@
         ($ typedesc.array-desc
            :base-type (compiler.ast-to-typedesc compiler array-type)
            :dimms dimm))
-       ((ast.expression.funcall :target (ast.expression.identifier :symbol 'rx-kw:const)
+       ((ast.expression.funcall :target (ast.expression.identifier :symbol 'rx-kw:|const|)
                                 :args (list x))
-        (let ((typ (compiler.ast-to-typedesc compiler x)))
-          (setf (typedesc/const typ) t)
-          typ))
+        (typedesc-make-const (compiler.ast-to-typedesc compiler x)))
        ((ast.expression.funcall :target (ast.expression.identifier :symbol 'rx-kw:*)
                                 :args (list x))
         ($ typedesc.pointer-desc :base-type (compiler.ast-to-typedesc compiler x))))
@@ -795,10 +912,15 @@
   (with-slots (name type-expr init) ast
     (compiler.check-types compiler init)
     (setf (var-def/type ast) (compiler.ast-to-typedesc compiler type-expr))
-    (unless (ty-equal (var-def/type ast) (expression/type init))
-      (error "In assignment ~a cannot convert ~a from type ~a to type ~a"
-             (ast/original-source ast)
-             (ast/original-source init)
+
+    (when (type/is-func (var-def/type ast))
+      (error "In definition ~a cannot assign to a variable of function type"
+             (ast/original-source ast)))
+
+    (unless (type/assignable-to (var-def/type ast) (expression/type init))
+      (error "In definition ~a cannot convert ~a from type ~a to type ~a"
+             (ast/original-source-string ast)
+             (ast/original-source-string init)
              (format-type (expression/type init) "x")
              (format-type (var-def/type ast) "x")))
     (lexical-env.push (compiler-lexenv compiler) name (var-def/type ast))))
@@ -820,9 +942,9 @@
 
         (loop for param-type in param-types
               for arg in args
-              do (unless (ty-equal param-type (expression/type arg))
+              do (unless (type/assignable-to param-type (expression/type arg))
                    (error "In function call ~a can't convert from argument ~a type ~a to parameter type ~a"
-                          (ast/original-source ast)
+                          (ast/original-source-string ast)
                           (format-ast arg)
                           (format-type (expression/type arg))
                           (format-type param-type ))))
@@ -840,11 +962,22 @@
 
 (defun compiler.check-types-function (compiler ast)
   (with-slots (name args ret-type-expr body) ast
-    (setf (function/type ast) ($ typedesc.func-desc
-                                 :ret-type (compiler.ast-to-typedesc compiler ret-type-expr)
-                                 :param-types (mapcar (lambda (arg)
-                                                        (compiler.ast-to-typedesc compiler (function-arg-type-expr arg)))
-                                                      args)))
+    (let ((param-types (mapcar (lambda (arg)
+                                 (compiler.ast-to-typedesc
+                                  compiler
+                                  (function-arg-type-expr arg)))
+                               args)))
+      (loop for p-type in param-types
+            for arg in args
+            do (when (type/is-array p-type)
+                 (error "In function ~a: array type not allowed in function parameter ~a"
+                        name
+                        (format-type p-type (symbol-name (function-arg-name arg))))))
+      (setf (function/type ast)
+            ($ typedesc.func-desc
+               :ret-type (compiler.ast-to-typedesc compiler ret-type-expr)
+               :param-types param-types)))
+
     (lexical-env.push (compiler-lexenv compiler) name (function/type ast))
     (with-lexical-env compiler
       (loop for arg-type in (func-desc/param-types (function/type ast))
@@ -899,33 +1032,29 @@
 (defun compiler.check-types-identifier (compiler ast)
   (setf (expression/type ast) (compiler.lookup-symbol-type compiler (identifier/symbol ast))))
 
+(defun compiler.check-types-character (compiler ast)
+  (setf (expression/type ast) *char*))
+
 (defun compiler.check-types-number (compiler ast)
   (with-slots (signed bits) ast
     (setf (expression/type ast)
-          (ematch (list signed bits)
-            ((list _ 32)
-             ($ typedesc.ref-desc
-                :name (format nil "~aint32_t" (if signed "" "u"))
-                :ref (lexical-env.lookup-or-error
-                      (compiler-lexenv compiler)
-                      'rx-kw:i32)))
-            ((list t 8)
-             ($ typedesc.ref-desc
-                :name "char"
-                :ref (lexical-env.lookup-or-error
-                      (compiler-lexenv compiler)
-                      'rx-kw:char)))))))
+          (let ((typ (if signed
+                         (cdr (assoc bits *bitsize-to-signed-type*))
+                         (cdr (assoc bits *bitsize-to-unsigned-type*)))))
+            (unless typ
+              (error "Internal error: expected a size of 8, 16, 32, 64 bits, got ~a" bits))
+            ($ typedesc.ref-desc
+               :name (ty/name typ)
+               :ref typ)))))
 
 (defun compiler.check-types-string-literal (compiler ast)
   (setf (expression/type ast)
         ($ typedesc.array-desc
            :dimms (list (1+ (length (string-literal/value ast))))
-           :base-type (typedesc-make-const
-                       ($ typedesc.ref-desc
-                          :name "char"
-                          :ref (lexical-env.lookup-or-error
-                                (compiler-lexenv compiler)
-                                'rx-kw:char))))))
+           :base-type ($ typedesc.ref-desc
+                         :name "char"
+                         :const t
+                         :ref *char*))))
 
 (defun compiler.check-types-binop (compiler ast)
   (with-slots (op lhs rhs) ast
@@ -936,21 +1065,25 @@
       ("="
        (unless (ast/is-lvalue lhs)
          (error "Assignment ~a = ~a expects lvalue"
-                (ast/original-source lhs)
-                (ast/original-source rhs)))
+                (ast/original-source-string lhs)
+                (ast/original-source-string rhs)))
        (when (typedesc/const (expression/type lhs))
-         (error "Assignment of const in ~a = ~a"
-                (ast/original-source lhs)
-                (ast/original-source rhs)))
+         (error "Assignment of const in ~a = ~a ~a"
+                (ast/original-source-string lhs)
+                (ast/original-source-string rhs)
+                (format-type (expression/type lhs))))
        (when (type/is-array (expression/type lhs))
-         (error "In assignment ~A cannot assign to expression of array type"
+         (error "In assignment ~a cannot assign to expression of array type"
+                (ast/original-source-string ast)))
+       (when (type/is-func (expression/type lhs))
+         (error "In assignment ~a cannot assign to expression of function type"
                 (ast/original-source ast)))
-       (unless (ty-equal (expression/type lhs) (expression/type rhs))
-         (error "In assignment ~s = ~s: type ~a cannot be converted to type ~a"
-                (ast/original-source lhs)
-                (ast/original-source rhs)
-                (format-type (expression/type rhs) "x")
-                (format-type (expression/type lhs) "x")))
+       (unless (type/assignable-to (expression/type lhs) (expression/type rhs))
+         (error "In assignment ~a = ~a: type ~a cannot be converted to type ~a"
+                (ast/original-source-string lhs)
+                (ast/original-source-string rhs)
+                (format-type (expression/type rhs))
+                (format-type (expression/type lhs))))
        (setf (expression/type ast)
              (expression/type lhs)))
       (_
@@ -958,11 +1091,15 @@
              (rhs-int (type/is-integral rhs)))
          (unless (and lhs-int
                       rhs-int
-                      (ty-equal lhs-int rhs-int))
-           (error "Type mismatch in operator ~a: Expression ~a and ~a are not integral or are different"
-                  ast
-                  lhs
-                  rhs))
+
+                      ;; Is this the right predicate to use here?
+                      (type/assignable-to lhs-int rhs-int))
+           (error "Type mismatch in operator ~a: Expression ~a and ~a are not integral or are different (~a vs ~a)"
+                  (ast/original-source-string ast)
+                  (ast/original-source-string lhs)
+                  (ast/original-source-string rhs)
+                  (format-type (expression/type lhs))
+                  (format-type (expression/type rhs))))
          (setf (expression/type ast)
                (expression/type lhs)))))))
 
@@ -987,7 +1124,7 @@
     (unless deref-type
       (error "Unary * expects pointer type, got ~a in ~a"
              (format-type (expression/type operand))
-             (ast/original-source ast)))
+             (ast/original-source-string ast)))
     (setf (expression/type ast) deref-type)))
 
 (defun compiler.check-types-address-of (compiler ast operand)
@@ -996,7 +1133,7 @@
   (let ((opnd-type (expression/type operand)))
     (unless (ast/is-lvalue operand)
       (error "Address-of operator expects lvalue in ~a"
-             (ast/original-source operand)))
+             (ast/original-source-string operand)))
 
     (setf (expression/type ast)
           ($ typedesc.pointer-desc :base-type opnd-type))))
@@ -1019,7 +1156,7 @@
        (setf (expression/type ast) base))
       (_
        (error "In array subscript ~a invalid type"
-              (ast/original-source ast)
+              (ast/original-source-string ast)
               (format-type (expression/type base)))))))
 
 (defun compiler.check-types (compiler ast)
@@ -1046,6 +1183,8 @@
      (compiler.check-types-identifier compiler ast))
     ((ast.expression.number)
      (compiler.check-types-number compiler ast))
+    ((ast.expression.character)
+     (compiler.check-types-character compiler ast))
     ((ast.expression.binop)
      (compiler.check-types-binop compiler ast))
     ((ast.expression.funcall)
@@ -1054,20 +1193,25 @@
      (compiler.check-types-unop compiler ast))))
 
 (defun read-property-access (stream char)
-  `(rx-kw:prop ,@(read-delimited-list #\] stream)))
-
-(set-macro-character #\[ #'read-property-access nil)
+  `(rx-kw:|prop| ,@(read-delimited-list #\] stream)))
 
 (defun right-bracket-read-error (stream char)
   (error "Unexpected ]"))
 
-(set-macro-character #\] #'right-bracket-read-error nil)
+(defparameter *rx-readtable* (copy-readtable))
+
+(setf (readtable-case *rx-readtable*) :preserve)
+
+(set-macro-character #\[ #'read-property-access nil *rx-readtable*)
+
+(set-macro-character #\] #'right-bracket-read-error nil *rx-readtable*)
 
 (defun main ()
   (with-open-file (s "test.rx")
-    (let ((*package* (find-package :rx-user)))
+    (let ((*package* (find-package :rx-user))
+          (*readtable* *rx-readtable*))
       (let ((compiler (new-compiler)))
-        (loop for x = (read s nil 'eof)
+        (loop for x = (read s nil 'eof )
               while (not (eq x 'eof))
               do
                  (let ((ast (compiler.parse compiler x)))
