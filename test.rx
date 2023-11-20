@@ -15,7 +15,7 @@
           (= asdf (& fef)))
 
 (function a ((blah (const foo))) i32
-          (- [blah'fehp] (+ 4 5))
+          (- [blah'fehp] (bxor 4 5))
 
           (= [blah'fehp] 3)
 

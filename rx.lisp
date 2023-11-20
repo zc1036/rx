@@ -26,6 +26,8 @@
    :|void| :|i32| :|i8| :|i16| :|i64| :|char|
    :|u8| :|u16| :|u32| :|u64|
 
+   :|template|
+
    :|block|))
 
 (defpackage :rx-user
@@ -538,14 +540,16 @@
 (defun new-lexical-env (&optional parent)
   (make-lexical-env :names (make-hash-table) :parent parent))
 
-(defun lexical-env.lookup-or-error (lexenv name)
+(defun lexical-env.lookup-or-error (lexenv name enforce-type)
   (typecheck name 'symbol)
 
   (if lexenv
       (let ((it (gethash name (lexical-env-names lexenv))))
         (if it
-            it
-            (lexical-env.lookup-or-error (lexical-env-parent lexenv) name)))
+            (if (typep it enforce-type)
+                it
+                (error "The name ~a is not of type ~a" enforce-type))
+            (lexical-env.lookup-or-error (lexical-env-parent lexenv) name enforce-type)))
       (error "The name ~a is not found" name)))
 
 (defun lexical-env.push (lexenv name value)
@@ -629,48 +633,74 @@
                         *void*))
     compiler))
 
-(defun compiler.parse-nary-op-to-binary-lassoc (compiler name ast1 ast2 rest)
-  (let ((expr ($ ast.expression.binop
-                 :op name
-                 :lhs ast1
-                 :rhs ast2)))
-    (if rest
-        (compiler.parse-nary-op-to-binary-lassoc
-         compiler
-         name
-         expr
-         (compiler.parse compiler (car rest))
-         (cdr rest))
+(defparameter *op-to-repr*
+  '((rx-kw:|bor| . "|")
+    (rx-kw:|band| . "&")
+    (rx-kw:|bxor| . "^")
+    (rx-kw:|and| . "&&")
+    (rx-kw:|or| . "||")))
 
-        expr)))
+(defparameter *form-parsers* nil)
+(setf *form-parsers* nil)
 
-(defun compiler.parse-nary-op-to-binary-rassoc (compiler name ast1 ast2 rest)
-  (let ((expr ($ ast.expression.binop
-                 :op name
-                 :lhs ast2
-                 :rhs ast1)))
-    (if rest
-        (compiler.parse-nary-op-to-binary-rassoc
-         compiler
-         name
-         expr
-         (compiler.parse compiler (car rest))
-         (cdr rest))
+(defmacro def-parser (name args matcher &body body)
+  (let ((compiler% (gensym))
+        (form% (gensym)))
+    `(progn
+       (defun ,name ,args
+         (ematch ,(second args)
+           (,matcher
+            ,@body)))
+       (setf
+        *form-parsers*
+        (append *form-parsers*
+                (list
+                 (lambda (,compiler% ,form%)
+                   (match ,form%
+                     (,matcher
+                      (,name ,compiler% ,form%))
+                     (_
+                      nil)))))))))
 
-        expr)))
+(defun compiler.parse* (compiler form)
+  (or (some (lambda (parser) (funcall parser compiler form))
+            *form-parsers*)
+      (error "No parser for form ~a" form)))
 
-(defun compiler.parse-unop (compiler op-name operand)
-  ($ ast.expression.unop
-     :operator op-name
-     :operand (compiler.parse compiler operand)))
+(def-parser compiler.parse-let (compiler form)
+    (list 'rx-kw:|let| name-sym type-expr init)
+  (typecheck name-sym 'symbol)
+  ($ ast.statement.var-def
+     :kind "let"
+     :name name-sym
+     :type-expr (compiler.parse-type-expr compiler type-expr)
+     :init (compiler.parse compiler init)))
 
-(defun compiler.parse-funcall (compiler fn args)
-  ($ ast.expression.funcall
-     :target (compiler.parse compiler fn)
-     :args (mapcar (bind #'compiler.parse compiler)
-                   args)))
+(def-parser compiler.parse-let-invalid! (compiler form)
+    (list* 'rx-kw:|let| _)
+  (error "Invalid syntax in let"))
 
-(defun compiler.parse-while (compiler condition body)
+(def-parser compiler.parse-if-else (compiler form)
+    (list 'rx-kw:|if| condition body else)
+  ($ ast.statement.if
+     :kind "if"
+     :condition (compiler.parse compiler condition)
+     :body (compiler.parse compiler body)
+     :else (when else (compiler.parse compiler else))))
+
+(def-parser compiler.parse-if (compiler form)
+    (list 'rx-kw:|if| cond body)
+  (compiler.parse-if-else compiler (append form nil)))
+
+(def-parser compiler.parse-compound-statement (compiler form)
+    (list* 'rx-kw:|block| stmts)
+  ($ ast.statement.compound
+     :kind "compound"
+     :statements (mapcar (bind #'compiler.parse compiler)
+                         stmts)))
+
+(def-parser compiler.parse-while (compiler form)
+    (list* 'rx-kw:|while| condition body)
   (let ((condition-ast (compiler.parse compiler condition)))
     (let ((body-asts (mapcar (bind #'compiler.parse compiler)
                              body)))
@@ -679,151 +709,32 @@
          :condition condition-ast
          :body body-asts))))
 
-(defun compiler.parse-compound-statement (compiler stmts)
-  ($ ast.statement.compound
-     :kind "compound"
-     :statements (mapcar (bind #'compiler.parse compiler)
-                         stmts)))
+(def-parser compiler.parse-function (compiler form)
+    (list* 'rx-kw:|function| name args ret-type body)
+  (typecheck name 'symbol)
+  (typecheck args 'list)
 
-(defun compiler.parse-if (compiler condition body else)
-  ($ ast.statement.if
-     :kind "if"
-     :condition (compiler.parse compiler condition)
-     :body (compiler.parse compiler body)
-     :else (when else (compiler.parse compiler else))))
-
-(defun compiler.parse-let (compiler name-sym type-decl init)
-  (typecheck name-sym 'symbol)
-
-  ($ ast.statement.var-def
-     :kind "let"
-     :name name-sym
-     :type-expr (compiler.parse-type compiler type-decl)
-     :init (compiler.parse compiler init)))
-
-(defun compiler.parse* (compiler form)
   (with-slots (lexenv) compiler
-    (ematch form
-      ((list 'rx-kw:|let| name type init)
-       (compiler.parse-let compiler name type init))
-      ((list* 'rx-kw:|let| _)
-       (error "Invalid syntax in let"))
-      ((list 'rx-kw:|if| cond body else)
-       (compiler.parse-if compiler cond body else))
-      ((list 'rx-kw:|if| cond body)
-       (compiler.parse-if compiler cond body nil))
-      ((list* 'rx-kw:|block| stmts)
-       (compiler.parse-compound-statement compiler stmts))
-      ((list* 'rx-kw:|while| condition body)
-       (compiler.parse-while compiler condition body))
-      ((list* 'rx-kw:|function| name args ret-type body)
-       (compiler.parse-function compiler name args ret-type body))
-      ((list* 'rx-kw:|struct| name types)
-       (compiler.parse-struct compiler name types))
-      ((list 'rx-kw:|return| expr)
-       ($ ast.statement.return
-          :kind "return"
-          :body (compiler.parse compiler expr)))
-      ((list* 'rx-kw:|prop| base member1 members)
-       (compiler.parse-prop compiler (compiler.parse compiler base) (cons member1 members)))
-      ((list* 'rx-kw:|prop| _)
-       (error "Invalid prop syntax"))
-      ((type character)
-       ($ ast.expression.character :value form))
-      ((type integer)
-       (if (> form #xFFFFFFFFFFFFFFFF)
-           (error "Integer ~a too large to fit in 64 bits" form)
-           (if (> form #x7FFFFFFFFFFFFFFF)
-               ($ ast.expression.number :value form :bits 64 :signed nil)
-               (if (> form #xFFFFFFFF)
-                   ($ ast.expression.number :value form :bits 64 :signed t)
-                   (if (> form #x7FFFFFFF)
-                       ($ ast.expression.number :value form :bits 32 :signed nil)
-                       ($ ast.expression.number :value form :bits 32 :signed t))))))
-      ((type string)
-       ($ ast.expression.string-literal :value form))
-      ((type symbol)
-       ($ ast.expression.identifier :symbol form))
-      ((list* (and op-name (or 'rx-kw:+ 'rx-kw:- 'rx-kw:/ 'rx-kw:* 'rx-kw:%
-                               'rx-kw:== 'rx-kw:!= 'rx-kw:< 'rx-kw:> 'rx-kw:<= 'rx-kw:>=
-                               'rx-kw:>> 'rx-kw:<<
-                               'rx-kw:|bor| 'rx-kw:|band| 'rx-kw:|bxor|
-                               'rx-kw:|and| 'rx-kw:|or|))
-              arg1 arg2 rest)
-       (compiler.parse-nary-op-to-binary-lassoc
-        compiler
-        (symbol-name op-name)
-        (compiler.parse compiler arg1)
-        (compiler.parse compiler arg2)
-        rest))
-      ((list* (and op-name (or 'rx-kw:=))
-              arg1 arg2 rest)
-       (let ((reversed-args (reverse (list* arg1 arg2 rest))))
-         (compiler.parse-nary-op-to-binary-rassoc
-          compiler
-          (symbol-name op-name)
-          (compiler.parse compiler (car reversed-args))
-          (compiler.parse compiler (cadr reversed-args))
-          (cddr reversed-args))))
-      ((list (and op-name (or 'rx-kw:* 'rx-kw:&))
-              arg)
-       (compiler.parse-unop compiler (symbol-name op-name) arg))
-      ((list* fn args)
-       (compiler.parse-funcall compiler fn args)))))
+    (let ((arg-structs
+            (loop for arg in args collect
+                                  (ematch arg
+                                    ((list arg-name arg-type)
+                                     (typecheck arg-name 'symbol)
 
-(defun compiler.parse (compiler form)
-  (let ((result (compiler.parse* compiler form)))
-    (setf (ast/original-source result) form)
-    result))
+                                     (make-function-arg
+                                      :name arg-name
+                                      :type-expr (compiler.parse-type-expr compiler arg-type))))))
+          (ret-type-expr (compiler.parse-type-expr compiler ret-type))
+          (parsed-body (mapcar (lambda (stmt) (compiler.parse compiler stmt)) body)))
+      ($ ast.statement.function
+         :kind "function"
+         :name name
+         :args arg-structs
+         :ret-type-expr ret-type-expr
+         :body parsed-body))))
 
-(defun compiler.parse-prop (compiler base members)
-  (ematch members
-    (nil
-     base)
-    ((list* (list 'quote mbr-sym) rest)
-     (compiler.parse-prop
-      compiler
-      ($ ast.expression.prop-access
-        :base base
-        :member mbr-sym)
-      rest))
-    ((list* (and member (integer)) rest)
-     (compiler.parse-prop
-      compiler
-      ($ ast.expression.array-sub
-        :base base
-        :sub (compiler.parse compiler member))
-      rest))))
-
-(defun compiler.parse-type (compiler typ)
-  "form -> AST"
-  (ematch typ
-    ((type symbol)
-     ($ ast.expression.identifier :symbol typ))
-    ((list 'rx-kw:|prop| arr-type (and (type integer) bound))
-     ($ ast.expression.array-sub
-        :base (compiler.parse-type compiler arr-type)
-        :sub bound))
-    ((list 'rx-kw:* x)
-     ($ ast.expression.funcall
-        :target ($ ast.expression.identifier
-                   :symbol 'rx-kw:*)
-        :args (list (compiler.parse-type compiler x))))
-    ((list* 'rx-kw:-> type1 rest)
-     ($ ast.expression.funcall
-        :target ($ ast.expression.identifier
-                   :symbol 'rx-kw:->)
-        :args (mapcar (bind #'compiler.parse-type compiler)
-                      (cons type1 rest))))
-    ((list 'rx-kw:|const| x)
-     ($ ast.expression.funcall
-        :target ($ ast.expression.identifier
-                   :symbol 'rx-kw:|const|)
-        :args (list (compiler.parse-type compiler x))))
-    (_
-     (error "Syntax error in type specification ~a" typ))))
-
-(defun compiler.parse-struct (compiler name members)
+(def-parser compiler.parse-struct (compiler form)
+    (list* 'rx-kw:|struct| name members)
   (typecheck name 'symbol)
   (typecheck members 'list)
 
@@ -840,34 +751,167 @@
          :kind "struct"
          :name name
          :field-names field-names
-         :field-type-exprs (mapcar (bind #'compiler.parse-type compiler)
+         :field-type-exprs (mapcar (bind #'compiler.parse-type-expr compiler)
                                    field-types)))))
 
-(defun compiler.parse-function (compiler name args ret-type body)
-  (typecheck name 'symbol)
-  (typecheck args 'list)
+(def-parser compiler.parse-return (compiler form)
+    (list 'rx-kw:|return| expr)
+  ($ ast.statement.return
+     :kind "return"
+     :body (compiler.parse compiler expr)))
 
-  (with-slots (lexenv) compiler
-    (let ((arg-structs
-            (loop for arg in args collect
-                                  (ematch arg
-                                    ((list arg-name arg-type)
-                                     (typecheck arg-name 'symbol)
+(def-parser compiler.parse-prop (compiler form)
+    (list* 'rx-kw:|prop| base member1 members)
 
-                                     (make-function-arg
-                                      :name arg-name
-                                      :type-expr (compiler.parse-type compiler arg-type))))))
-          (ret-type-expr (compiler.parse-type compiler ret-type))
-          (parsed-body (mapcar (lambda (stmt) (compiler.parse compiler stmt)) body)))
-      ($ ast.statement.function
-         :kind "function"
-         :name name
-         :args arg-structs
-         :ret-type-expr ret-type-expr
-         :body parsed-body))))
+  (labels ((parse-prop (compiler base members)
+             (ematch members
+               (nil
+                base)
+               ((list* (list 'quote mbr-sym) rest)
+                (parse-prop
+                 compiler
+                 ($ ast.expression.prop-access
+                    :base base
+                    :member mbr-sym)
+                 rest))
+               ((list* (and member (integer)) rest)
+                (parse-prop
+                 compiler
+                 ($ ast.expression.array-sub
+                    :base base
+                    :sub (compiler.parse compiler member))
+                 rest)))))
+    (parse-prop compiler (compiler.parse compiler base) (cons member1 members))))
 
-;; ((ast.expression.number)
-;;  ($ typedesc.ref-desc :name "int32_t" :ref (lexical-env.lookup-or-error lexenv "int32_t")))
+(def-parser compiler.parse-invalid-prop (compiler form)
+    (list* 'rx-kw:|prop| _)
+  (error "Invalid prop syntax"))
+
+(def-parser compiler.parse-char (compiler form)
+    (type character)
+  ($ ast.expression.character :value form))
+
+(def-parser compiler.parse-integer (compiler form)
+    (type integer)
+  (if (> form #xFFFFFFFFFFFFFFFF)
+      (error "Integer ~a too large to fit in 64 bits" form)
+      (if (> form #x7FFFFFFFFFFFFFFF)
+          ($ ast.expression.number :value form :bits 64 :signed nil)
+          (if (> form #xFFFFFFFF)
+              ($ ast.expression.number :value form :bits 64 :signed t)
+              (if (> form #x7FFFFFFF)
+                  ($ ast.expression.number :value form :bits 32 :signed nil)
+                  ($ ast.expression.number :value form :bits 32 :signed t))))))
+
+(def-parser compiler.parse-string (compiler form)
+    (type string)
+  ($ ast.expression.string-literal :value form))
+
+(def-parser compiler.parse-identifier (compiler form)
+    (type symbol)
+  ($ ast.expression.identifier :symbol form))
+
+(defun compiler.parse-nary-op-to-binary-lassoc (compiler name ast1 ast2 rest)
+  (let ((expr ($ ast.expression.binop
+                 :op name
+                 :lhs ast1
+                 :rhs ast2)))
+    (if rest
+        (compiler.parse-nary-op-to-binary-lassoc
+         compiler
+         name
+         expr
+         (compiler.parse compiler (car rest))
+         (cdr rest))
+
+        expr)))
+
+(def-parser compiler.parse-nary-lassoc-expr (compiler form)
+    (list* (and op-name (or 'rx-kw:+ 'rx-kw:- 'rx-kw:/ 'rx-kw:* 'rx-kw:%
+                            'rx-kw:== 'rx-kw:!= 'rx-kw:< 'rx-kw:> 'rx-kw:<= 'rx-kw:>=
+                            'rx-kw:>> 'rx-kw:<<
+                            'rx-kw:|bor| 'rx-kw:|band| 'rx-kw:|bxor|
+                            'rx-kw:|and| 'rx-kw:|or|))
+           arg1 arg2 rest)
+  (compiler.parse-nary-op-to-binary-lassoc
+   compiler
+   (or (cdr (assoc op-name *op-to-repr*)) (symbol-name op-name))
+   (compiler.parse compiler arg1)
+   (compiler.parse compiler arg2)
+   rest))
+
+(defun compiler.parse-nary-op-to-binary-rassoc (compiler name ast1 ast2 rest)
+  (let ((expr ($ ast.expression.binop
+                 :op name
+                 :lhs ast2
+                 :rhs ast1)))
+    (if rest
+        (compiler.parse-nary-op-to-binary-rassoc
+         compiler
+         name
+         expr
+         (compiler.parse compiler (car rest))
+         (cdr rest))
+
+        expr)))
+
+(def-parser compiler.parse-nary-rassoc-expr (compiler form)
+    (list* (and op-name (or 'rx-kw:=))
+           arg1 arg2 rest)
+  (let ((reversed-args (reverse (list* arg1 arg2 rest))))
+    (compiler.parse-nary-op-to-binary-rassoc
+     compiler
+     (symbol-name op-name)
+     (compiler.parse compiler (car reversed-args))
+     (compiler.parse compiler (cadr reversed-args))
+     (cddr reversed-args))))
+
+(def-parser compiler.parse-unop (compiler form)
+    (list (and op-name (or 'rx-kw:* 'rx-kw:&))
+          operand)
+  ($ ast.expression.unop
+     :operator (symbol-name op-name)
+     :operand (compiler.parse compiler operand)))
+
+(def-parser compiler.parse-funcall (compiler form)
+    (list* fn args)
+  ($ ast.expression.funcall
+     :target (compiler.parse compiler fn)
+     :args (mapcar (bind #'compiler.parse compiler)
+                   args)))
+
+(defun compiler.parse (compiler form)
+  (let ((result (compiler.parse* compiler form)))
+    (setf (ast/original-source result) form)
+    result))
+
+(defun compiler.parse-type-expr (compiler typ)
+  "form -> AST"
+  (ematch typ
+    ((type symbol)
+     ($ ast.expression.identifier :symbol typ))
+    ((list 'rx-kw:|prop| arr-type (and (type integer) bound))
+     ($ ast.expression.array-sub
+        :base (compiler.parse-type-expr compiler arr-type)
+        :sub bound))
+    ((list 'rx-kw:* x)
+     ($ ast.expression.funcall
+        :target ($ ast.expression.identifier
+                   :symbol 'rx-kw:*)
+        :args (list (compiler.parse-type-expr compiler x))))
+    ((list* 'rx-kw:-> type1 rest)
+     ($ ast.expression.funcall
+        :target ($ ast.expression.identifier
+                   :symbol 'rx-kw:->)
+        :args (mapcar (bind #'compiler.parse-type-expr compiler)
+                      (cons type1 rest))))
+    ((list 'rx-kw:|const| x)
+     ($ ast.expression.funcall
+        :target ($ ast.expression.identifier
+                   :symbol 'rx-kw:|const|)
+        :args (list (compiler.parse-type-expr compiler x))))
+    (_
+     (error "Syntax error in type specification ~a" typ))))
 
 (defun compiler.ast-to-typedesc (compiler ast)
   "AST -> typedesc"
@@ -875,7 +919,7 @@
     (typecheck
      (ematch ast
        ((ast.expression.identifier :symbol name)
-        (ematch (lexical-env.lookup-or-error lexenv name)
+        (ematch (lexical-env.lookup-or-error lexenv name '(or ty typedesc))
           ((and typ (ty :name name))
            ($ typedesc.ref-desc :name name :ref typ))
           ((and typ (typedesc))
@@ -1025,12 +1069,11 @@
        (compiler.check-types-pointer-deref compiler base member)))))
 
 (defun compiler.lookup-symbol-type (compiler sym)
-  (typecheck
-   (lexical-env.lookup-or-error (compiler-lexenv compiler) sym)
-   'typedesc))
+  (lexical-env.lookup-or-error (compiler-lexenv compiler) sym 'typedesc))
 
 (defun compiler.check-types-identifier (compiler ast)
-  (setf (expression/type ast) (compiler.lookup-symbol-type compiler (identifier/symbol ast))))
+  (setf (expression/type ast)
+        (compiler.lookup-symbol-type compiler (identifier/symbol ast))))
 
 (defun compiler.check-types-character (compiler ast)
   (setf (expression/type ast) *char*))
