@@ -952,7 +952,9 @@
         ($ typedesc.pointer-desc :base-type (compiler.ast-to-typedesc compiler x))))
      'typedesc)))
 
-(defun compiler.check-types-var-def (compiler ast)
+(defgeneric compiler.check-types (compiler ast))
+
+(defmethod compiler.check-types (compiler (ast ast.statement.var-def))
   (with-slots (name type-expr init) ast
     (compiler.check-types compiler init)
     (setf (var-def/type ast) (compiler.ast-to-typedesc compiler type-expr))
@@ -969,7 +971,7 @@
              (format-type (var-def/type ast) "x")))
     (lexical-env.push (compiler-lexenv compiler) name (var-def/type ast))))
 
-(defun compiler.check-types-funcall (compiler ast)
+(defmethod compiler.check-types (compiler (ast ast.expression.funcall))
   (with-slots (target args) ast
     (compiler.check-types compiler target)
     (mapc (bind #'compiler.check-types compiler) args)
@@ -995,7 +997,7 @@
 
         (setf (expression/type ast) ret-type)))))
 
-(defun compiler.check-types-while (compiler ast)
+(defmethod compiler.check-types (compiler (ast ast.statement.while))
   (with-lexical-env compiler
     (with-slots (condition body) ast
       (compiler.check-types compiler condition)
@@ -1004,7 +1006,7 @@
 
       (mapc (bind #'compiler.check-types compiler) body))))
 
-(defun compiler.check-types-function (compiler ast)
+(defmethod compiler.check-types (compiler (ast ast.statement.function))
   (with-slots (name args ret-type-expr body) ast
     (let ((param-types (mapcar (lambda (arg)
                                  (compiler.ast-to-typedesc
@@ -1031,7 +1033,7 @@
                                 arg-type))
       (mapc (bind #'compiler.check-types compiler) body))))
 
-(defun compiler.check-types-struct (compiler ast)
+(defmethod compiler.check-types (compiler (ast ast.statement.struct))
   (with-slots (name field-names field-type-exprs) ast
     (let ((struct-t ($ ty.struct-t
                        :name name
@@ -1055,28 +1057,31 @@
                    finally
                       (error "Struct ~a doesn't have a field named ~a" (ty/name struct) member-sym)))))))
 
-(defun compiler.check-types-prop (compiler ast base member)
-  (compiler.check-types compiler base)
+(defun compiler.check-types (compiler (ast ast.expression.prop-access))
+  (with-slots (base member) ast
+    (compiler.check-types compiler base)
 
-  (let ((base-type (expression/type base)))
-    (ematch (list base-type member)
-      ((list (typedesc.ref-desc :ref (ty.struct-t)) member-name)
-       (typecheck member-name 'symbol)
-       (compiler.check-types-struct-member-access compiler ast base member-name))
-      ((list (typedesc.array-desc) _)
-       (compiler.check-types-array-access compiler base))
-      ((list (typedesc.pointer-desc) _)
-       (compiler.check-types-pointer-deref compiler base member)))))
+    (let ((base-type (expression/type base)))
+      (ematch (list base-type member)
+        ((list (typedesc.ref-desc :ref (ty.struct-t)) member-name)
+         (typecheck member-name 'symbol)
+         (compiler.check-types-struct-member-access compiler ast base member-name))
+        ((list (typedesc.array-desc) _)
+         (compiler.check-types-array-access compiler base))
+        ((list (typedesc.pointer-desc) _)
+         (compiler.check-types-pointer-deref compiler base member))))))
 
 (defun compiler.lookup-symbol-type (compiler sym)
   (lexical-env.lookup-or-error (compiler-lexenv compiler) sym 'typedesc))
 
-(defun compiler.check-types-identifier (compiler ast)
+(defmethod compiler.check-types (compiler (ast ast.expression.identifier))
   (setf (expression/type ast)
         (compiler.lookup-symbol-type compiler (identifier/symbol ast))))
 
-(defun compiler.check-types-character (compiler ast)
+(defmethod compiler.check-types (compiler (ast ast.expression.character))
   (setf (expression/type ast) *char*))
+
+(defmethod )
 
 (defun compiler.check-types-number (compiler ast)
   (with-slots (signed bits) ast
